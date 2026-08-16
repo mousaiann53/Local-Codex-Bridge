@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Writable } from "node:stream";
 
+import { childEnvironment } from "./child-environment.js";
 import {
   RuntimeStore,
   redactText,
@@ -33,6 +34,7 @@ export interface AppServerLaunchOptions {
   executable?: string;
   prefixArgs?: readonly string[];
   requestTimeoutMs?: number;
+  environment?: NodeJS.ProcessEnv;
 }
 
 function rpcKey(id: RpcId): string {
@@ -43,6 +45,38 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function assertExactStringSet(
+  value: unknown,
+  expected: readonly string[],
+  label: string,
+): void {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`Codex managed requirements must define ${label}`);
+  }
+  const actual = new Set(value as string[]);
+  if (actual.size !== expected.length || expected.some((item) => !actual.has(item))) {
+    throw new Error(`Codex managed requirements ${label} do not match the Bridge security ceiling`);
+  }
+}
+
+export function assertHardenedRequirements(value: unknown): void {
+  const response = asRecord(value);
+  const requirements = asRecord(response?.requirements);
+  if (!requirements) {
+    throw new Error("Codex managed requirements are missing; hardened execution is disabled");
+  }
+  assertExactStringSet(
+    requirements.allowedApprovalPolicies,
+    ["untrusted", "on-request"],
+    "allowedApprovalPolicies",
+  );
+  assertExactStringSet(
+    requirements.allowedSandboxModes,
+    ["read-only", "workspace-write"],
+    "allowedSandboxModes",
+  );
 }
 
 function messageFromUnknown(value: unknown): string {
@@ -195,6 +229,7 @@ export class AppServerManager {
   readonly #executable: string;
   readonly #prefixArgs: readonly string[];
   readonly #requestTimeoutMs: number;
+  readonly #environment: NodeJS.ProcessEnv;
   readonly #pendingCalls = new Map<string, PendingCall>();
   readonly #writeLine: (chunk: string) => Promise<void>;
 
@@ -212,7 +247,8 @@ export class AppServerManager {
     options: AppServerLaunchOptions = {},
   ) {
     this.runtime = runtime;
-    this.#executable = options.executable ?? resolveCodexExecutable();
+    this.#environment = options.environment ?? process.env;
+    this.#executable = options.executable ?? resolveCodexExecutable(this.#environment);
     this.#prefixArgs = options.prefixArgs ?? [];
     this.#requestTimeoutMs =
       options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -277,7 +313,7 @@ export class AppServerManager {
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
           windowsHide: true,
-          env: process.env,
+          env: childEnvironment(this.#environment),
         },
       );
     } catch (error) {
@@ -320,15 +356,20 @@ export class AppServerManager {
             version: "2.1.1",
           },
           capabilities: {
-            experimentalApi: true,
+            experimentalApi: false,
             requestAttestation: false,
-            mcpServerOpenaiFormElicitation: false,
             optOutNotificationMethods: [],
           },
         },
         30_000,
       );
-      await this.#write({ method: "initialized", params: {} });
+      await this.#write({ method: "initialized" });
+      const requirements = await this.#request(
+        "configRequirements/read",
+        undefined,
+        30_000,
+      );
+      assertHardenedRequirements(requirements);
       this.#initialized = true;
     } catch (error) {
       const failure =
@@ -421,7 +462,13 @@ export class AppServerManager {
     if (method) {
       if (id !== undefined) {
         const recorded = this.runtime.recordServerRequest(id, method, record.params);
-        if (!recorded) {
+        if (recorded === "duplicate") {
+          this.#protocolFailure(
+            `duplicate active app-server server request id ${JSON.stringify(id)}`,
+          );
+          return;
+        }
+        if (recorded === "threadless") {
           void this.#write({
             id,
             error: THREADLESS_REQUEST_ERROR,

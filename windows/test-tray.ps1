@@ -19,6 +19,28 @@ Assert-True ((Resolve-NotReadyBaseIconState 'starting' $false) -ceq 'starting') 
 Assert-True ((Resolve-NotReadyBaseIconState 'attention' $false) -ceq 'attention') 'Ownership-proof attention must survive non-ready polling.'
 Assert-True ((Resolve-NotReadyBaseIconState 'stopped' $true) -ceq 'starting') 'An owned non-ready Tunnel must show starting.'
 
+foreach ($readyUrl in @(
+    'http://127.0.0.1:8765/readyz',
+    'https://LOCALHOST/readyz',
+    'http://[::1]:8765/readyz'
+)) {
+    Assert-True (Test-LoopbackReadyUrl $readyUrl) "Loopback readiness URL must be accepted: $readyUrl"
+}
+foreach ($readyUrl in @(
+    '',
+    'ftp://127.0.0.1/readyz',
+    'http://127.0.0.2/readyz',
+    'http://127.0.0.1.evil.example/readyz',
+    'http://127.0.0.1evil.example/readyz',
+    'http://localhost.evil.example/readyz',
+    'http://user@127.0.0.1/readyz',
+    'http://127.0.0.1@evil.example/readyz',
+    'http://user@localhost/readyz',
+    'http://[::ffff:127.0.0.1]/readyz'
+)) {
+    Assert-True (-not (Test-LoopbackReadyUrl $readyUrl)) "Non-loopback, userinfo, or host-concatenated readiness URL must be rejected: $readyUrl"
+}
+
 $iconDirectory = Join-Path $PSScriptRoot 'icons'
 foreach ($state in @('stopped', 'starting', 'ready', 'attention', 'error')) {
     $iconPath = Join-Path $iconDirectory "$state.ico"
@@ -68,6 +90,7 @@ foreach ($state in @('stopped', 'starting', 'ready', 'attention', 'error')) {
 Assert-True ($traySource -match '\$env:LOCAL_CODEX_BRIDGE_READY_URL') 'Tray ReadyUrl must come from an explicit parameter or public environment variable.'
 Assert-True ($traySource -match '\$env:LOCAL_CODEX_BRIDGE_TUNNEL_PROFILE') 'Tray profile must come from an explicit parameter or public environment variable.'
 Assert-True ($traySource -match '\$env:LOCAL_CODEX_BRIDGE_TUNNEL_EXE') 'Tray executable must come from an explicit parameter or public environment variable.'
+Assert-True ($traySource -match 'Test-LoopbackReadyUrl\s+\$ReadyUrl') 'Tray must enforce the loopback-ready URL guard before startup.'
 Assert-True ($traySource -notmatch '\[string\]\$ReadyUrl\s*=\s*''http') 'Tray must not bake in a readiness URL.'
 Assert-True ($traySource -notmatch '\[string\]\$ProfileName\s*=\s*''') 'Tray must not bake in a Tunnel profile.'
 Assert-True ($traySource -notmatch '\[string\]\$TunnelExecutable\s*=\s*"') 'Tray must not bake in a Tunnel executable path.'

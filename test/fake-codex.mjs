@@ -12,6 +12,14 @@ let currentTurn = "turn-1";
 let threadlessParentId;
 let unknownRequestResponseReceived = false;
 const requestCounts = new Map();
+const threadCwds = new Map();
+const syntheticSecretPresent = Object.hasOwn(
+  process.env,
+  "LOCAL_CODEX_BRIDGE_TEST_SYNTHETIC_SECRET",
+);
+const rustLogPresent = Object.keys(process.env).some(
+  (name) => name.toUpperCase() === "RUST_LOG",
+);
 
 const countedMethods = new Set([
   "thread/start",
@@ -35,7 +43,9 @@ lines.on("line", (line) => {
   if (message.method === "initialize") {
     if (
       message.params?.clientInfo?.name !== "local-codex-bridge" ||
-      message.params?.clientInfo?.title !== "Local Codex Bridge"
+      message.params?.clientInfo?.title !== "Local Codex Bridge" ||
+      message.params?.capabilities?.experimentalApi !== false ||
+      Object.hasOwn(message.params?.capabilities ?? {}, "mcpServerOpenaiFormElicitation")
     ) {
       send({ id: message.id, error: { code: -32602, message: "unexpected public client identity" } });
       return;
@@ -44,6 +54,23 @@ lines.on("line", (line) => {
     return;
   }
   if (message.method === "initialized") {
+    if (Object.hasOwn(message, "params")) process.exit(65);
+    return;
+  }
+  if (message.method === "configRequirements/read") {
+    if (Object.hasOwn(message, "params") && message.params !== null) {
+      send({ id: message.id, error: { code: -32602, message: "configRequirements/read params must be omitted or null" } });
+      return;
+    }
+    send({
+      id: message.id,
+      result: {
+        requirements: {
+          allowedApprovalPolicies: ["untrusted", "on-request"],
+          allowedSandboxModes: ["read-only", "workspace-write"],
+        },
+      },
+    });
     return;
   }
   if (message.method === "thread/start") {
@@ -53,6 +80,7 @@ lines.on("line", (line) => {
     }
     threadCounter += 1;
     currentThread = `thread-${threadCounter}`;
+    threadCwds.set(currentThread, message.params.cwd);
     if (message.params?.testNoAcknowledgement === true) {
       return;
     }
@@ -61,6 +89,9 @@ lines.on("line", (line) => {
   }
   if (message.method === "thread/resume") {
     currentThread = message.params.threadId;
+    if (message.params.cwd) {
+      threadCwds.set(currentThread, message.params.cwd);
+    }
     if (message.params?.testNoAcknowledgement === true) {
       return;
     }
@@ -127,6 +158,7 @@ lines.on("line", (line) => {
       result: {
         thread: {
           id: message.params.threadId,
+          cwd: threadCwds.get(message.params.threadId) ?? process.cwd(),
           status: { type: "notLoaded" },
           turns: message.params.includeTurns
             ? [{ id: "stored-turn", status: "completed", items: [{ type: "agentMessage", text: "STORED_OK" }] }]
@@ -138,6 +170,10 @@ lines.on("line", (line) => {
   }
   if (message.method === "test/request-counts") {
     send({ id: message.id, result: Object.fromEntries(requestCounts) });
+    return;
+  }
+  if (message.method === "test/child-environment") {
+    send({ id: message.id, result: { syntheticSecretPresent, rustLogPresent } });
     return;
   }
   if (message.method === "test/unknown-request") {
@@ -152,6 +188,19 @@ lines.on("line", (line) => {
       },
     });
     send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "test/duplicate-server-request") {
+    send({
+      id: "duplicate-approval",
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-dup-a", turnId: "turn-dup-a", cwd: process.cwd(), command: ["echo", "first"] },
+    });
+    send({
+      id: "duplicate-approval",
+      method: "item/fileChange/requestApproval",
+      params: { threadId: "thread-dup-b", turnId: "turn-dup-b", cwd: process.cwd(), changes: [] },
+    });
     return;
   }
   if (message.method === "test/unknown-request-status") {

@@ -20,7 +20,7 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 
 The seven public tools have distinct semantics:
 
-- `codex_threads`: list/search/read persistent native threads; filters are not access control.
+- `codex_threads`: list/search/read only persistent native threads whose persisted cwd passes the authorized-root gate.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
@@ -34,7 +34,7 @@ Preserve these distinctions, the tool names, validation, annotations, and stdout
 
 The Bridge is not an OS sandbox and must not claim to be one. Codex permissions come from the official runtime plus the selected sandbox and approval policy. Prompts constrain intended behavior; they do not reduce native process capability by themselves.
 
-Treat thread visibility, the Bridge process environment, and the local OS user as trust boundaries. The app-server child inherits the Bridge environment. Do not add secrets to fixtures, logs, examples, profiles, or command lines, and do not assume transport sanitization provides hostile multi-tenant isolation.
+Treat thread visibility, the Bridge process environment, and the local OS user as trust boundaries. The app-server child receives only the explicit environment allowlist in `src/child-environment.ts`. Do not add secrets to fixtures, logs, examples, profiles, or command lines, and do not assume transport sanitization provides hostile multi-tenant isolation.
 
 Never fabricate approval or user-input request IDs. A response must match an actually pending request's ID, thread, method, and turn scope. Do not silently widen `cwd` filters into security claims. Avoid stdout diagnostics because stdout is reserved for MCP JSON-RPC; operational diagnostics belong on stderr and still require redaction.
 

@@ -1,6 +1,7 @@
 export type RpcId = string | number;
 
 export const MAX_OBSERVE_WAIT_MS = 10_000;
+const MAX_AUTHORIZED_THREAD_BINDINGS = 1_024;
 
 import type {
   UxCounts,
@@ -302,6 +303,7 @@ export class RuntimeStore {
   readonly #pending = new Map<string, PendingServerRequest>();
   readonly #turnToThread = new Map<string, string>();
   readonly #changeWaiters = new Map<string, Set<() => void>>();
+  readonly #authorizedWorkspaces = new Map<string, string>();
 
   constructor(
     private readonly ringLimit = 256,
@@ -315,6 +317,26 @@ export class RuntimeStore {
 
   hasThread(threadId: string): boolean {
     return this.#threads.has(threadId);
+  }
+
+  authorizedWorkspace(threadId: string): string | null {
+    return this.#authorizedWorkspaces.get(threadId) ?? null;
+  }
+
+  bindAuthorizedWorkspace(threadId: string, cwd: string): void {
+    this.#authorizedWorkspaces.delete(threadId);
+    this.#authorizedWorkspaces.set(threadId, cwd);
+    while (this.#authorizedWorkspaces.size > MAX_AUTHORIZED_THREAD_BINDINGS) {
+      const oldest = this.#authorizedWorkspaces.keys().next().value as string | undefined;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#authorizedWorkspaces.delete(oldest);
+    }
+    const runtime = this.#threads.get(threadId);
+    if (runtime) {
+      this.#signalChange(runtime);
+    }
   }
 
   currentCursor(threadId: string): number {
@@ -370,6 +392,7 @@ export class RuntimeStore {
     if (!threadId) {
       return;
     }
+
 
     this.ensureThread(threadId);
     const runtime = this.#threads.get(threadId)!;
@@ -427,11 +450,15 @@ export class RuntimeStore {
     this.#appendEvent(runtime, method, params, turnId);
   }
 
-  recordServerRequest(id: RpcId, method: string, params: unknown): boolean {
+  recordServerRequest(
+    id: RpcId,
+    method: string,
+    params: unknown,
+  ): "recorded" | "threadless" | "duplicate" {
     const extractedTurnId = extractTurnId(params);
     const threadId = extractThreadId(params) ?? (extractedTurnId ? this.#turnToThread.get(extractedTurnId) : undefined);
     if (!threadId) {
-      return false;
+      return "threadless";
     }
     this.ensureThread(threadId);
     const turnId = extractedTurnId ?? this.#threads.get(threadId)?.activeTurnId ?? undefined;
@@ -444,7 +471,30 @@ export class RuntimeStore {
       ...(turnId ? { turnId } : {}),
     };
     const key = idKey(id);
-    const newlyObservable = !this.#pending.has(key);
+    const existing = this.#pending.get(key);
+    if (existing) {
+      this.#appendEvent(
+        this.#threads.get(existing.threadId)!,
+        "bridge/security/pendingRequestCollision",
+        {
+          request_id: id,
+          existing_method: existing.method,
+          existing_thread_id: existing.threadId,
+          existing_turn_id: existing.turnId ?? null,
+          duplicate_method: method,
+          duplicate_thread_id: threadId,
+          duplicate_turn_id: turnId ?? null,
+        },
+        existing.turnId,
+      );
+      this.#publishUx({
+        kind: "waiting_approval",
+        thread_id: existing.threadId,
+        turn_id: existing.turnId ?? null,
+        status: "security_error",
+      });
+      return "duplicate";
+    }
     this.#pending.set(key, request);
     this.#appendEvent(
       this.#threads.get(threadId)!,
@@ -452,23 +502,22 @@ export class RuntimeStore {
       { request_id: id, params: request.params },
       turnId,
     );
-    this.#publishUx(newlyObservable ? {
+    this.#publishUx({
       kind: method === "item/tool/requestUserInput" || method.toLowerCase().includes("elicitation")
         ? "waiting_user_input"
         : "waiting_approval",
       thread_id: threadId,
       turn_id: turnId ?? null,
       status: "waiting",
-    } : undefined);
-    return true;
+    });
+    return "recorded";
   }
 
-  takePending(
+  peekPending(
     id: RpcId,
     expected: { threadId: string; method: string; turnId?: string },
   ): PendingServerRequest {
-    const key = idKey(id);
-    const request = this.#pending.get(key);
+    const request = this.#pending.get(idKey(id));
     if (!request) {
       throw new Error(`No pending app-server request with raw id ${JSON.stringify(id)}`);
     }
@@ -478,6 +527,15 @@ export class RuntimeStore {
     if (expected.turnId !== undefined && request.turnId !== expected.turnId) {
       throw new Error("Pending request scope does not match turn_id");
     }
+    return request;
+  }
+
+  takePending(
+    id: RpcId,
+    expected: { threadId: string; method: string; turnId?: string },
+  ): PendingServerRequest {
+    const key = idKey(id);
+    const request = this.peekPending(id, expected);
     this.#pending.delete(key);
     const runtime = this.#threads.get(request.threadId);
     if (runtime) {
@@ -488,7 +546,11 @@ export class RuntimeStore {
   }
 
   restorePending(request: PendingServerRequest): void {
-    this.#pending.set(idKey(request.rawId), request);
+    const key = idKey(request.rawId);
+    if (this.#pending.has(key)) {
+      throw new Error("Cannot restore pending request because its typed raw id is already active");
+    }
+    this.#pending.set(key, request);
     const runtime = this.#threads.get(request.threadId);
     if (runtime) {
       this.#signalChange(runtime);

@@ -56,8 +56,8 @@ test("projection is opt-in, atomic-shaped, bounded, monotonic, and content-free"
 
   const raw = readFileSync(path, "utf8");
   const document = readProjection(path);
-  assert.equal(document.sequence, 3);
-  assert.deepEqual(document.signals.map((signal) => signal.sequence), [2, 3]);
+  assert.equal(document.sequence, 4);
+  assert.deepEqual(document.signals.map((signal) => signal.sequence), [3, 4]);
   assert.deepEqual(document.signals.map((signal) => signal.kind), ["waiting_user_input", "terminal"]);
   assert.deepEqual(document.counts, { active: 0, waiting: 0, terminal: 1 });
   assert.doesNotMatch(raw, /DO_NOT_PROJECT/);

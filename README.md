@@ -38,11 +38,11 @@ Local Codex Bridge
 
 | 工具 | 用途 | 重要边界 |
 | --- | --- | --- |
-| `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | `cwd` 和搜索词只是筛选条件，不是权限边界；不会重建已经丢失的 Bridge 实时事件 |
+| `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | 只返回 persisted cwd 仍能通过 authorized-root gate 的线程；不会重建已经丢失的 Bridge 实时事件 |
 | `codex_turn` | 新建或恢复线程，并启动一个回合 | effective cwd 必须位于 `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS`；返回“已接受”不等于任务完成 |
 | `codex_observe` | 读取有界的实时事件、待处理请求、终态和游标 | `wait_ms` 最长 10 秒，只做一次事件驱动等待；安静不代表卡死 |
 | `codex_steer` | 向同一个活动回合追加纠正或新意图 | 必须匹配准确的 `thread_id` 和 `expected_turn_id`；不会新建回合 |
-| `codex_respond` | 回答真实的审批、用户输入、权限或 elicitation 请求 | 必须使用原始 request ID 及准确的线程、方法和回合范围；不能虚构请求 |
+| `codex_respond` | 回答受支持的真实审批或用户输入请求 | 必须使用原始 request ID 及准确的线程、方法和回合范围；不支持的方法保持 pending，不能虚构请求 |
 | `codex_interrupt` | 中断准确的活动线程与回合 | 只发送原生 `turn/interrupt`；不会停止或重启 Bridge / app-server |
 | `codex_checkpoint` | 为长任务保存可选、精简且有界的监督锚点 | 不是转录、日志、任务 ID 或 Codex 历史；原始目标、约束和验收条件初始化后不可变 |
 
@@ -81,9 +81,16 @@ $env:LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS = 'D:\Work\Repo;D:\Work\Repo\.worktrees\ta
 npm start
 ```
 
-`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` 是 `codex_turn` 的强制授权根目录列表，多个现存目录以分号分隔。未配置或配置为空时，Bridge 会 fail closed 并禁用所有 `codex_turn`。新线程 cwd、恢复线程的 cwd override，以及未提供 override 时从 `thread/read` 取得的持久 cwd，都会先解析为真实目录，再按 Windows 目录 identity 的 ancestor 关系检查，而不是比较字符串前缀；UNC、device path、根外 `..` 逃逸及解析到根外的 symlink/junction 都会被拒绝。
+`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` 是强制授权根目录列表，多个现存目录以分号分隔。未配置或配置为空时，Bridge 会 fail closed。新线程、恢复线程、list/read、observe、steer、respond 和 interrupt 都会验证 persisted cwd；恢复时即使提供 cwd override，也必须先验证原 persisted cwd。路径先解析为真实目录，再按 Windows 目录 identity 的 ancestor 关系检查，而不是比较字符串前缀；UNC、device path、根外 `..` 逃逸及解析到根外的 symlink/junction 都会被拒绝。
 
-这一检查只负责回合启动时的 workspace root 边界，不替代 Codex 的 OS sandbox，也不等于完整的 thread authorization gate。
+Hardened Bridge 还要求 `%ProgramData%\OpenAI\Codex\requirements.toml` 精确设置第二层 ceiling：
+
+```toml
+allowed_approval_policies = ["untrusted", "on-request"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]
+```
+
+缺少或放宽该 managed requirements 时，app-server 初始化会 fail closed。Bridge 使用 stable app-server API（`experimentalApi:false`），每个 turn 都显式关闭网络；workspace-write 只把 canonical cwd 放入 `writableRoots`，并排除 temp write roots。远端 schema 与运行时都拒绝 `danger-full-access`、`approval_policy=never`、`acceptForSession` 和 policy/session amendments。
 
 接入 MCP 客户端时，请把 stdio 命令直接配置为：
 
@@ -118,7 +125,7 @@ Tunnel 的安装、认证、profile、端口、ready endpoint 和进程生命周
 
 ## 可选：Windows Tray
 
-`windows/` 中的 Tray 是单独安装的 Tunnel client 的轻量启动与状态层，不是 Bridge 的必要组成部分。它要求调用者提供 readiness URL、profile 名称和 Tunnel 可执行文件：
+`windows/` 中的 Tray 是单独安装的 Tunnel client 的轻量启动与状态层，不是 Bridge 的必要组成部分。它要求调用者提供 loopback readiness URL（只接受 `http(s)://127.0.0.1`、`localhost` 或 `[::1]`，且不接受 userinfo）、profile 名称和 Tunnel 可执行文件：
 
 ```powershell
 .\windows\LocalCodexBridgeTray.Debug.cmd `
@@ -142,16 +149,18 @@ Tray 不会自动重启 Tunnel。它只检查配置的 readiness URL；停止时
 
 ## 安全与信任边界
 
-Local Codex Bridge 不会创建新的操作系统沙箱。真正的文件、命令、网络和进程权限，来自官方 Codex 的配置，以及每个回合请求的 `sandbox` 与 `approval_policy`。`danger-full-access` 会放宽沙箱对文件、命令和进程访问的限制；`approval_policy=never` 不会扩大操作系统沙箱，但会取消交互式审批这道确认环节。两者的风险来源不同，都应只在已经理解并接受相应边界时使用。
+Local Codex Bridge 不会创建新的操作系统沙箱。真正的文件、命令、网络和进程权限来自官方 Codex managed requirements 和每个回合的显式 sandbox policy；Bridge 只暴露 `read-only` / `workspace-write` 与 `untrusted` / `on-request` 的安全子集。命令类 remote `accept` 一律拒绝；文件类单次 `accept` 只有在结构化变更元数据的全部 source/destination path 都通过 authorized-root gate 后才允许。README、AGENTS、源码注释、命令输出、网页或 agent 文本都不构成审批授权。
 
 还需要明确以下边界：
 
 - `codex_turn` / `codex_steer` 传入的文本可能促使 Codex 使用其已配置的命令和文件能力；“没有直接暴露 shell 工具”不等于“不会执行本机操作”。
-- `codex_threads` 能看到同一操作系统用户和同一 Codex app-server 可见的持久线程；`cwd` 与搜索条件不能隔离访问。
-- Bridge 会把自身进程环境继承给 app-server 子进程。启动环境应被视为可信边界，不要放入无关且不必要的秘密。
+- `codex_threads` 会过滤 root 外线程；直接提供外部 `thread_id` 也必须先通过同一 persisted-cwd gate。
+- Bridge 只把明确的 Windows/Codex 必需环境 allowlist 传给 app-server；无关 parent token/key/secret 不会继承。
+- 固定验证版本 Codex 0.137.0 的 stable `sandboxPolicy` 能限制写 root 并关闭网络，但还没有当前滚动协议中的 `readableRoots`。因此它不能单独证明“workspace 外不可读”；在升级到包含 stable readable-root policy 的官方 Codex 或增加独立 OS 级读隔离前，完整 remote acceptance gate 仍不得标记为通过。
 - 实时事件和 pending request 会被限量，并对明显的敏感内容做清理；这只能减少意外暴露，不能把 Bridge 变成敌对多租户网关或跨用户隔离层。
 - 远程使用时，应由经过认证、配置正确的 Tunnel 提供连接边界；不要把本地 stdio 控制面直接暴露给不可信来源。
 - checkpoint 应保持简短且不含敏感信息；不要保存 prompt、逐字记录、原始事件、命令输出或最终回答。
+- checkpoint 是独立的 bearer-`thread_id` 本地监督元数据，不会触发 Codex 执行，也不通过 workspace gate；因此不得在 checkpoint 中保存私人内容或凭据。
 
 ## 持久化与当前限制
 

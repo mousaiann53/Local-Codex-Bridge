@@ -53,12 +53,16 @@ async function within<T>(promise: Promise<T>, milliseconds = 150): Promise<T> {
 function controlFor(runtime: RuntimeStore): ControlSurface {
   const appServer = {
     runtime,
-    request: async (method: string): Promise<unknown> => {
+    request: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
       assert.equal(method, "thread/read");
-      return { thread: { id: "stored-thread", turns: [] } };
+      return { thread: { id: params.threadId, cwd: process.cwd(), turns: [] } };
     },
   } as unknown as AppServerManager;
-  return new ControlSurface(appServer);
+  return new ControlSurface(
+    appServer,
+    undefined,
+    new WorkspaceRootPolicy([process.cwd()]),
+  );
 }
 
 test("sanitizer redacts obvious secrets and bounds strings", () => {
@@ -134,6 +138,31 @@ test("workspace roots canonicalize real directories and reject traversal and rep
 
     const filePath = join(allowedRoot, "not-a-directory.txt");
     writeFileSync(filePath, "fixture", "utf8");
+    assert.equal(policy.authorizeTargetPath(filePath), realpathSync.native(filePath));
+    assert.equal(
+      policy.authorizeTargetPath("future-file.txt", inside),
+      join(realpathSync.native(inside), "future-file.txt"),
+    );
+    assert.throws(
+      () => policy.authorizeTargetPath("future-file.txt"),
+      /requires an authorized cwd/,
+    );
+    assert.throws(
+      () => policy.authorizeTargetPath("..\\..\\Allowed-neighbor\\future.txt", inside),
+      /outside the configured allowed roots/,
+    );
+    assert.throws(
+      () => policy.authorizeTargetPath(join(escapingJunction, "future.txt")),
+      /outside the configured allowed roots/,
+    );
+    assert.throws(
+      () => policy.authorizeTargetPath("\\\\server\\share\\file.txt"),
+      /UNC or Windows device/,
+    );
+    assert.throws(
+      () => policy.authorizeTargetPath(`${filePath}:stream`),
+      /alternate data stream/,
+    );
     assert.throws(
       () => policy.authorizeCwd(filePath),
       /must resolve to an existing local directory/,
@@ -216,7 +245,13 @@ test("codex_turn fails closed without roots and authorizes persisted resume cwd 
       request: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
         calls.push({ method, params });
         if (method === "thread/read") {
-          return { thread: { id: "stored-thread", cwd: persistedCwd } };
+          const threadId = params.threadId as string;
+          return {
+            thread: {
+              id: threadId,
+              cwd: threadId === "stored-thread" ? persistedCwd : allowedCwd,
+            },
+          };
         }
         if (method === "thread/resume") {
           return { thread: { id: "stored-thread" } };
@@ -244,13 +279,15 @@ test("codex_turn fails closed without roots and authorizes persisted resume cwd 
     assert.deepEqual(calls.map((call) => call.method), [
       "thread/read",
       "thread/resume",
+      "thread/read",
       "turn/start",
     ]);
     const canonicalCwd = realpathSync.native(allowedCwd);
     assert.equal(calls[0]?.params.threadId, "stored-thread");
     assert.equal(calls[0]?.params.includeTurns, false);
     assert.equal(calls[1]?.params.cwd, canonicalCwd);
-    assert.equal(calls[2]?.params.cwd, canonicalCwd);
+    assert.equal(calls[2]?.params.threadId, "stored-thread");
+    assert.equal(calls[3]?.params.cwd, canonicalCwd);
 
     calls.length = 0;
     const explicitResume = await control.call("codex_turn", {
@@ -259,9 +296,9 @@ test("codex_turn fails closed without roots and authorizes persisted resume cwd 
       cwd: allowedCwd,
     }) as Record<string, unknown>;
     assert.equal(explicitResume.accepted, true);
-    assert.deepEqual(calls.map((call) => call.method), ["thread/resume", "turn/start"]);
-    assert.equal(calls[0]?.params.cwd, canonicalCwd);
+    assert.deepEqual(calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "turn/start"]);
     assert.equal(calls[1]?.params.cwd, canonicalCwd);
+    assert.equal(calls[3]?.params.cwd, canonicalCwd);
 
     calls.length = 0;
     const newThread = await control.call("codex_turn", {
@@ -269,9 +306,9 @@ test("codex_turn fails closed without roots and authorizes persisted resume cwd 
       cwd: allowedCwd,
     }) as Record<string, unknown>;
     assert.equal(newThread.accepted, true);
-    assert.deepEqual(calls.map((call) => call.method), ["thread/start", "turn/start"]);
+    assert.deepEqual(calls.map((call) => call.method), ["thread/start", "thread/read", "turn/start"]);
     assert.equal(calls[0]?.params.cwd, canonicalCwd);
-    assert.equal(calls[1]?.params.cwd, canonicalCwd);
+    assert.equal(calls[2]?.params.cwd, canonicalCwd);
 
     calls.length = 0;
     await assert.rejects(
@@ -294,12 +331,188 @@ test("codex_turn fails closed without roots and authorizes persisted resume cwd 
     persistedCwd = outsideCwd;
     await assert.rejects(
       control.call("codex_turn", {
+        text: "reject safe override on an unauthorized persisted thread",
+        thread_id: "stored-thread",
+        cwd: allowedCwd,
+      }),
+      /outside the configured allowed roots/,
+    );
+    assert.deepEqual(calls.map((call) => call.method), ["thread/read"]);
+
+    calls.length = 0;
+    await assert.rejects(
+      control.call("codex_turn", {
         text: "reject unsafe resume",
         thread_id: "stored-thread",
       }),
       /outside the configured allowed roots/,
     );
     assert.deepEqual(calls.map((call) => call.method), ["thread/read"]);
+  } finally {
+    rmSync(testDirectory, { recursive: true, force: true });
+  }
+});
+
+test("thread access gate hides outside threads and remote permission inputs fail closed", async () => {
+  const testDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-thread-gate-"));
+  try {
+    const allowedRoot = join(testDirectory, "allowed");
+    const allowedCwd = join(allowedRoot, "workspace");
+    const outsideCwd = join(testDirectory, "outside");
+    mkdirSync(allowedCwd, { recursive: true });
+    mkdirSync(outsideCwd);
+
+    const threadCwds = new Map([
+      ["allowed-thread", allowedCwd],
+      ["outside-thread", outsideCwd],
+    ]);
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const responses: Array<{ id: string | number; result: unknown }> = [];
+    const runtime = new RuntimeStore();
+    const manager = {
+      runtime,
+      request: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+        calls.push({ method, params });
+        if (method === "thread/list") {
+          return {
+            data: [...threadCwds].map(([id, cwd]) => ({ id, cwd })),
+            nextCursor: null,
+            backwardsCursor: null,
+          };
+        }
+        if (method === "thread/read") {
+          const id = params.threadId as string;
+          return { thread: { id, cwd: threadCwds.get(id), turns: [] } };
+        }
+        if (method === "thread/start") {
+          threadCwds.set("new-thread", params.cwd as string);
+          return { thread: { id: "new-thread", cwd: params.cwd } };
+        }
+        if (method === "turn/start") {
+          return { turn: { id: "new-turn", status: "inProgress" } };
+        }
+        if (method === "turn/steer") {
+          return { turnId: params.expectedTurnId };
+        }
+        if (method === "turn/interrupt") {
+          return {};
+        }
+        throw new Error(`unexpected method: ${method}`);
+      },
+      respond: async (id: string | number, result: unknown): Promise<void> => {
+        responses.push({ id, result });
+      },
+    } as unknown as AppServerManager;
+    const control = new ControlSurface(
+      manager,
+      undefined,
+      new WorkspaceRootPolicy([allowedRoot]),
+    );
+
+    const listed = await control.call("codex_threads", {}) as Record<string, unknown>;
+    assert.deepEqual(
+      (listed.data as Array<Record<string, unknown>>).map((thread) => thread.id),
+      ["allowed-thread"],
+    );
+    assert.equal(runtime.authorizedWorkspace("outside-thread"), null);
+
+    const read = await control.call("codex_threads", {
+      thread_id: "allowed-thread",
+    }) as Record<string, unknown>;
+    assert.equal((read.thread as Record<string, unknown>).id, "allowed-thread");
+    assert.equal(runtime.authorizedWorkspace("allowed-thread"), realpathSync.native(allowedCwd));
+
+    for (const [tool, args, forbiddenMethod] of [
+      ["codex_threads", { thread_id: "outside-thread" }, undefined],
+      ["codex_observe", { thread_id: "outside-thread" }, undefined],
+      ["codex_steer", { thread_id: "outside-thread", expected_turn_id: "turn-x", text: "no" }, "turn/steer"],
+      ["codex_interrupt", { thread_id: "outside-thread", turn_id: "turn-x" }, "turn/interrupt"],
+    ] as const) {
+      calls.length = 0;
+      await assert.rejects(
+        control.call(tool, args),
+        /outside the configured allowed roots/,
+      );
+      assert.deepEqual(calls.map((call) => call.method), ["thread/read"]);
+      if (forbiddenMethod) {
+        assert.equal(calls.some((call) => call.method === forbiddenMethod), false);
+      }
+    }
+
+    runtime.markTurnAccepted("outside-thread", "turn-x");
+    assert.equal(runtime.recordServerRequest(71, "item/fileChange/requestApproval", {
+      threadId: "outside-thread",
+      turnId: "turn-x",
+    }), "recorded");
+    calls.length = 0;
+    await assert.rejects(
+      control.call("codex_respond", {
+        request_id: 71,
+        thread_id: "outside-thread",
+        turn_id: "turn-x",
+        method: "item/fileChange/requestApproval",
+        decision: "decline",
+      }),
+      /outside the configured allowed roots/,
+    );
+    assert.deepEqual(calls.map((call) => call.method), ["thread/read"]);
+    assert.equal(responses.length, 0);
+    assert.equal(runtime.pendingForThread("outside-thread").length, 1);
+
+    for (const forbidden of [
+      { sandbox: "danger-full-access" },
+      { approval_policy: "never" },
+    ]) {
+      calls.length = 0;
+      await assert.rejects(
+        control.call("codex_turn", {
+          text: "blocked before native RPC",
+          cwd: allowedCwd,
+          ...forbidden,
+        }),
+        /must be one of/,
+      );
+      assert.equal(calls.length, 0);
+    }
+
+    calls.length = 0;
+    await control.call("codex_turn", {
+      text: "safe defaults",
+      cwd: allowedCwd,
+    });
+    assert.deepEqual(calls.map((call) => call.method), ["thread/start", "thread/read", "turn/start"]);
+    assert.equal(calls[0]?.params.sandbox, "read-only");
+    assert.equal(calls[0]?.params.approvalPolicy, "untrusted");
+    assert.equal(calls[2]?.params.approvalPolicy, "untrusted");
+    assert.deepEqual(calls[2]?.params.sandboxPolicy, {
+      type: "readOnly",
+      networkAccess: false,
+    });
+
+    calls.length = 0;
+    await control.call("codex_turn", {
+      text: "restricted workspace write",
+      cwd: allowedCwd,
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    });
+    assert.equal(calls[0]?.params.sandbox, "read-only");
+    assert.deepEqual(calls[2]?.params.sandboxPolicy, {
+      type: "workspaceWrite",
+      writableRoots: [realpathSync.native(allowedCwd)],
+      networkAccess: false,
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
+    });
+
+    const turnTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_turn")!;
+    const turnProperties = turnTool.inputSchema.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(turnProperties.sandbox?.enum, ["read-only", "workspace-write"]);
+    assert.deepEqual(turnProperties.approval_policy?.enum, ["untrusted", "on-request"]);
+    const respondTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_respond")!;
+    const respondProperties = respondTool.inputSchema.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(respondProperties.decision?.enum, ["accept", "decline", "cancel"]);
+    assert.equal("execpolicy_amendment" in respondProperties, false);
   } finally {
     rmSync(testDirectory, { recursive: true, force: true });
   }
@@ -348,6 +561,85 @@ test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures 
   assert.equal(observed.events.length, 2);
   assert.equal(observed.terminal?.final_result, "DONE");
   assert.equal(observed.runtime_status, "completed");
+});
+
+test("duplicate typed pending ids preserve the original request and emit a security event", () => {
+  const runtime = new RuntimeStore();
+  runtime.markTurnAccepted("thread-original", "turn-original");
+  runtime.markTurnAccepted("thread-string", "turn-string");
+  runtime.markTurnAccepted("thread-duplicate", "turn-duplicate");
+
+  assert.equal(runtime.recordServerRequest(7, "execCommandApproval", {
+    threadId: "thread-original",
+    turnId: "turn-original",
+    command: ["cmd", "/c", "echo original"],
+  }), "recorded");
+  assert.equal(runtime.recordServerRequest("7", "applyPatchApproval", {
+    threadId: "thread-string",
+    turnId: "turn-string",
+  }), "recorded");
+  assert.equal(runtime.recordServerRequest(7, "applyPatchApproval", {
+    threadId: "thread-duplicate",
+    turnId: "turn-duplicate",
+  }), "duplicate");
+
+  assert.equal(runtime.peekPending(7, {
+    threadId: "thread-original",
+    turnId: "turn-original",
+    method: "execCommandApproval",
+  }).threadId, "thread-original");
+  assert.equal(runtime.peekPending("7", {
+    threadId: "thread-string",
+    turnId: "turn-string",
+    method: "applyPatchApproval",
+  }).threadId, "thread-string");
+  assert.throws(() => runtime.peekPending(7, {
+    threadId: "thread-duplicate",
+    turnId: "turn-duplicate",
+    method: "applyPatchApproval",
+  }), /scope does not match/);
+
+  const collision = runtime.observe("thread-original", 0, 50)!;
+  assert.equal(
+    collision.events.some((event) => event.method === "bridge/security/pendingRequestCollision"),
+    true,
+  );
+
+  const original = runtime.takePending(7, {
+    threadId: "thread-original",
+    turnId: "turn-original",
+    method: "execCommandApproval",
+  });
+  assert.equal(runtime.recordServerRequest(7, "applyPatchApproval", {
+    threadId: "thread-duplicate",
+    turnId: "turn-duplicate",
+  }), "recorded");
+  assert.throws(
+    () => runtime.restorePending(original),
+    /typed raw id is already active/,
+  );
+});
+
+test("pending approvals are process-local and cannot be replayed after restart", () => {
+  const beforeRestart = new RuntimeStore();
+  beforeRestart.markTurnAccepted("thread-restart", "turn-restart");
+  assert.equal(beforeRestart.recordServerRequest(19, "execCommandApproval", {
+    threadId: "thread-restart",
+    turnId: "turn-restart",
+    command: ["cmd", "/c", "echo pending"],
+  }), "recorded");
+  assert.equal(beforeRestart.pendingForThread("thread-restart").length, 1);
+
+  const afterRestart = new RuntimeStore();
+  assert.deepEqual(afterRestart.pendingForThread("thread-restart"), []);
+  assert.throws(
+    () => afterRestart.takePending(19, {
+      threadId: "thread-restart",
+      turnId: "turn-restart",
+      method: "execCommandApproval",
+    }),
+    /No pending/,
+  );
 });
 
 test("observe wait defaults to immediate and buffered events bypass waiting", async () => {

@@ -86,6 +86,28 @@ function Resolve-TerminalNotice {
     }
 }
 
+function Test-LoopbackReadyUrl {
+    param(
+        [AllowNull()]
+        [string]$ReadyUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ReadyUrl)) { return $false }
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($ReadyUrl, [UriKind]::Absolute, [ref]$uri)) { return $false }
+    if (@('http', 'https') -notcontains $uri.Scheme) { return $false }
+    if (-not [string]::IsNullOrEmpty($uri.UserInfo)) { return $false }
+
+    if ([string]::Equals($uri.DnsSafeHost, '127.0.0.1', [StringComparison]::Ordinal)) { return $true }
+    if ([string]::Equals($uri.DnsSafeHost, 'localhost', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($uri.HostNameType -ne [UriHostNameType]::IPv6) { return $false }
+
+    $address = $null
+    return [Net.IPAddress]::TryParse($uri.DnsSafeHost, [ref]$address) -and
+        $address.Equals([Net.IPAddress]::IPv6Loopback)
+}
+
 function Test-TunnelOwnershipEvidence {
     param(
         [Parameter(Mandatory = $true)]$Ownership,
@@ -122,4 +144,4 @@ function Test-TunnelOwnershipEvidence {
     return $true
 }
 
-Export-ModuleMember -Function New-ProjectionCursor, Resolve-TrayIconState, Resolve-NotReadyBaseIconState, Select-NewProjectionSignals, Resolve-TerminalNotice, Test-TunnelOwnershipEvidence
+Export-ModuleMember -Function New-ProjectionCursor, Resolve-TrayIconState, Resolve-NotReadyBaseIconState, Select-NewProjectionSignals, Resolve-TerminalNotice, Test-LoopbackReadyUrl, Test-TunnelOwnershipEvidence

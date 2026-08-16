@@ -137,8 +137,8 @@ try {
   const started = await first.call("codex_turn", {
     cwd: smokeCwd,
     sandbox: "read-only",
-    approval_policy: "never",
-    text: "Read-only smoke: run PowerShell Start-Sleep -Seconds 6, then read package.json without modifying anything, and finish with exactly BRIDGE_SMOKE_OK.",
+    approval_policy: "untrusted",
+    text: "Read-only smoke: inspect package.json without modifying anything. If a command approval is declined, do not retry it; finish with exactly BRIDGE_SMOKE_OK.",
   });
   const acceptedMs = Date.now() - startedAt;
   const immediate = await first.call("codex_observe", {
@@ -149,7 +149,22 @@ try {
   if (immediate.terminal) {
     throw new Error("codex_turn did not demonstrably return before terminal completion");
   }
-  const finished = await observeToTerminal(first, started.thread_id, 0);
+  const firstResponses = new Set();
+  const finished = await observeToTerminal(first, started.thread_id, 0, async (observed) => {
+    for (const request of observed.pending_requests) {
+      if (!request.method.toLowerCase().includes("approval")) continue;
+      const key = `${typeof request.request_id}:${String(request.request_id)}`;
+      if (firstResponses.has(key)) continue;
+      firstResponses.add(key);
+      await first.call("codex_respond", {
+        request_id: request.request_id,
+        thread_id: request.thread_id,
+        turn_id: request.turn_id,
+        method: request.method,
+        decision: "decline",
+      });
+    }
+  });
   if (!String(finished.observed.terminal.final_result).includes("BRIDGE_SMOKE_OK")) {
     throw new Error("First live turn did not produce BRIDGE_SMOKE_OK");
   }
@@ -204,7 +219,7 @@ try {
       cwd: smokeCwd,
       sandbox: "read-only",
       approval_policy: "untrusted",
-      text: "Read-only staged smoke: use the command tool to run exactly PowerShell -NoProfile -Command \"Start-Sleep -Seconds 15; Get-Content -LiteralPath package.json -TotalCount 1\". Do not modify anything. Only after the command finishes, answer BRIDGE_UNSTEERED.",
+      text: "Read-only staged smoke: request a harmless command, but if approval is declined do not retry it. Wait for steering before finishing.",
     });
     let stagedState = null;
     let pendingApproval = null;
@@ -233,7 +248,7 @@ try {
     const steered = await second.call("codex_steer", {
       thread_id: staged.thread_id,
       expected_turn_id: staged.turn_id,
-      text: "For this same active turn, read tsconfig.json instead and finish with exactly BRIDGE_STEERED_OK. Do not modify files.",
+      text: "For this same active turn, do not run a command and finish with exactly BRIDGE_STEERED_OK. Do not modify files.",
     });
     if (steered.turn_id !== staged.turn_id) {
       throw new Error("turn/steer changed the turn id");
@@ -261,7 +276,7 @@ try {
         thread_id: pendingApproval.thread_id,
         turn_id: pendingApproval.turn_id,
         method: pendingApproval.method,
-        decision: "accept",
+        decision: "decline",
       });
       approvalResponded = true;
       respondedApprovals.add(`${typeof pendingApproval.request_id}:${String(pendingApproval.request_id)}`);
@@ -284,7 +299,7 @@ try {
             thread_id: request.thread_id,
             turn_id: request.turn_id,
             method: request.method,
-            decision: "accept",
+            decision: "decline",
           });
           approvalResponded = true;
         }

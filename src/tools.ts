@@ -7,11 +7,11 @@ import {
 import {
   MAX_OBSERVE_WAIT_MS,
   sanitizeForTransport,
+  type PendingServerRequest,
   type RpcId,
 } from "./runtime.js";
 import {
   WorkspaceRootPolicy,
-  validateWindowsCwd,
 } from "./workspace-roots.js";
 
 export { validateWindowsCwd } from "./workspace-roots.js";
@@ -32,14 +32,16 @@ export interface ToolDefinition {
 
 const approvalPolicySchema = {
   type: "string",
-  enum: ["untrusted", "on-request", "never"],
-  description: "Codex app-server approval policy override.",
+  enum: ["untrusted", "on-request"],
+  default: "untrusted",
+  description: "Restricted Codex approval policy. Session-wide and never-ask policies are not exposed.",
 };
 
 const sandboxSchema = {
   type: "string",
-  enum: ["read-only", "workspace-write", "danger-full-access"],
-  description: "Codex app-server sandbox mode override.",
+  enum: ["read-only", "workspace-write"],
+  default: "read-only",
+  description: "Restricted Codex sandbox mode. Full filesystem access is not exposed.",
 };
 
 const SUPPORTED_RESPONSE_METHODS = new Set([
@@ -237,14 +239,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         method: { type: "string", minLength: 1, description: "Exact app-server request method." },
         decision: {
           type: "string",
-          enum: ["accept", "acceptForSession", "decline", "cancel"],
-          description: "Command or file approval decision.",
-        },
-        execpolicy_amendment: {
-          type: "array",
-          minItems: 1,
-          items: { type: "string" },
-          description: "Command approval exec-policy amendment; encoded in app-server's native decision shape.",
+          enum: ["accept", "decline", "cancel"],
+          description: "One-request command or file approval decision. Session-wide approval is not exposed.",
         },
         answers: {
           type: "object",
@@ -267,7 +263,6 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       required: ["request_id", "thread_id", "method"],
       anyOf: [
         { required: ["decision"] },
-        { required: ["execpolicy_amendment"] },
         { required: ["answers"] },
         { required: ["response"] },
       ],
@@ -671,6 +666,81 @@ export class ControlSurface {
     return this.checkpoints;
   }
 
+  #bindAuthorizedThread(threadId: string, result: unknown): string {
+    if (extractThreadId(result, "thread/read") !== threadId) {
+      throw new Error("thread/read returned a different thread id");
+    }
+    const cwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(result));
+    this.appServer.runtime.bindAuthorizedWorkspace(threadId, cwd);
+    return cwd;
+  }
+
+  async #readAuthorizedThread(
+    threadId: string,
+    includeTurns: boolean,
+  ): Promise<Record<string, unknown>> {
+    this.workspaceRoots.requireConfigured();
+    const result = await this.appServer.request("thread/read", {
+      threadId,
+      includeTurns,
+    });
+    this.#bindAuthorizedThread(threadId, result);
+    return responseRecord(result, "thread/read");
+  }
+
+  #guardApprovalAccept(
+    method: string,
+    pending: PendingServerRequest,
+  ): void {
+    const params = asObject(pending.params, "pending approval params");
+    if (
+      params.grantRoot !== undefined && params.grantRoot !== null ||
+      params.networkApprovalContext !== undefined && params.networkApprovalContext !== null ||
+      params.proposedExecpolicyAmendment !== undefined && params.proposedExecpolicyAmendment !== null ||
+      params.proposedNetworkPolicyAmendments !== undefined && params.proposedNetworkPolicyAmendments !== null
+    ) {
+      throw new Error("Remote approval cannot grant roots, network access, or policy/session amendments");
+    }
+
+    if (
+      method === "item/commandExecution/requestApproval" ||
+      method === "execCommandApproval"
+    ) {
+      throw new Error(
+        "Remote command approval accept is disabled because shell text cannot prove workspace-only effects",
+      );
+    }
+
+    const cwd = this.appServer.runtime.authorizedWorkspace(pending.threadId);
+    if (!cwd) {
+      throw new Error("Pending approval is not bound to an authorized workspace");
+    }
+    const paths: string[] = [];
+    if (method === "item/fileChange/requestApproval") {
+      throw new Error(
+        "Current file approval accept is disabled because the request does not contain a complete path snapshot",
+      );
+    } else if (method === "applyPatchApproval") {
+      const changes = asObject(params.fileChanges, "applyPatchApproval fileChanges");
+      const entries = Object.entries(changes);
+      if (entries.length === 0) {
+        throw new Error("Legacy file approval has no structured file changes");
+      }
+      for (const [target, changeValue] of entries) {
+        paths.push(target);
+        const change = asObject(changeValue, "applyPatchApproval file change");
+        if (change.type === "update" && typeof change.move_path === "string") {
+          paths.push(change.move_path);
+        }
+      }
+    } else {
+      throw new Error(`Unsupported approval guard method: ${method}`);
+    }
+    for (const target of paths) {
+      this.workspaceRoots.authorizeTargetPath(target, cwd);
+    }
+  }
+
   async #threads(args: Record<string, unknown>): Promise<unknown> {
     onlyKeys(args, ["thread_id", "include_turns", "cwd", "search_term", "cursor", "limit"]);
     const threadId = optionalString(args, "thread_id", 200);
@@ -679,17 +749,15 @@ export class ControlSurface {
         throw new Error("thread_id cannot be combined with list/search fields");
       }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
-      const result = await this.appServer.request("thread/read", {
-        threadId,
-        includeTurns,
-      });
-      return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read") });
+      const result = await this.#readAuthorizedThread(threadId, includeTurns);
+      return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...result });
     }
     if (args.include_turns !== undefined) {
       throw new Error("include_turns is valid only with thread_id");
     }
+    this.workspaceRoots.requireConfigured();
     const cwdInput = optionalString(args, "cwd", 1_000);
-    const cwd = cwdInput ? validateWindowsCwd(cwdInput) : undefined;
+    const cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
     const searchTerm = optionalString(args, "search_term", 500);
     const cursor = optionalString(args, "cursor", 10_000);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 20;
@@ -705,18 +773,31 @@ export class ControlSurface {
     if (!Array.isArray(page.data)) {
       throw new Error("thread/list returned no data array");
     }
+    const visible = page.data.flatMap((value) => {
+      try {
+        const thread = asObject(value, "thread/list item");
+        if (typeof thread.id !== "string" || thread.id.length === 0) {
+          return [];
+        }
+        const authorizedCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd({ thread }));
+        this.appServer.runtime.bindAuthorizedWorkspace(thread.id, authorizedCwd);
+        return [sanitizeForTransport(thread, {
+          maxStringChars: 4_000,
+          maxDepth: 6,
+          maxArrayItems: 20,
+          maxObjectKeys: 60,
+          totalCharBudget: 12_000,
+        })];
+      } catch {
+        return [];
+      }
+    });
     return {
       source: "codex_app_server",
       mode: "list",
       nextCursor: typeof page.nextCursor === "string" ? page.nextCursor : null,
       backwardsCursor: typeof page.backwardsCursor === "string" ? page.backwardsCursor : null,
-      data: page.data.map((thread) => sanitizeForTransport(thread, {
-        maxStringChars: 4_000,
-        maxDepth: 6,
-        maxArrayItems: 20,
-        maxObjectKeys: 60,
-        totalCharBudget: 12_000,
-      })),
+      data: visible,
     };
   }
 
@@ -728,24 +809,22 @@ export class ControlSurface {
     if (!requestedThreadId && !cwdInput) {
       throw new Error("cwd is required when thread_id is omitted");
     }
-    this.workspaceRoots.requireConfigured();
-    let cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
-    if (requestedThreadId && !cwd) {
-      const storedThread = await this.appServer.request("thread/read", {
-        threadId: requestedThreadId,
-        includeTurns: false,
-      });
-      cwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(storedThread));
-    }
     const model = optionalString(args, "model", 100);
     const effort = optionalString(args, "effort", 32);
-    const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write", "danger-full-access"] as const);
-    const approvalPolicy = enumValue(args, "approval_policy", ["untrusted", "on-request", "never"] as const);
+    const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write"] as const) ?? "read-only";
+    const approvalPolicy = enumValue(args, "approval_policy", ["untrusted", "on-request"] as const) ?? "untrusted";
+    this.workspaceRoots.requireConfigured();
+    let cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
+    if (requestedThreadId) {
+      const storedThread = await this.#readAuthorizedThread(requestedThreadId, false);
+      const persistedCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(storedThread));
+      cwd ??= persistedCwd;
+    }
     const overrides = {
-      ...(cwd ? { cwd } : {}),
+      cwd,
       ...(model ? { model } : {}),
-      ...(sandbox ? { sandbox } : {}),
-      ...(approvalPolicy ? { approvalPolicy } : {}),
+      sandbox: "read-only",
+      approvalPolicy,
     };
 
     const threadResult = requestedThreadId
@@ -764,14 +843,31 @@ export class ControlSurface {
     if (requestedThreadId && threadId !== requestedThreadId) {
       throw new Error("thread/resume returned a different thread id");
     }
-    this.appServer.runtime.ensureThread(threadId);
+    const resumedThread = await this.#readAuthorizedThread(threadId, false);
+    const effectiveCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(resumedThread));
+    if (effectiveCwd.toLowerCase() !== cwd!.toLowerCase()) {
+      throw new Error("native thread cwd does not match the authorized requested cwd");
+    }
+    this.appServer.runtime.bindAuthorizedWorkspace(threadId, effectiveCwd);
     const turnResult = await this.appServer.request("turn/start", {
       threadId,
       input: [{ type: "text", text, text_elements: [] }],
-      ...(cwd ? { cwd } : {}),
+      cwd: effectiveCwd,
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
-      ...(approvalPolicy ? { approvalPolicy } : {}),
+      approvalPolicy,
+      sandboxPolicy: sandbox === "workspace-write"
+        ? {
+            type: "workspaceWrite",
+            writableRoots: [effectiveCwd],
+            networkAccess: false,
+            excludeTmpdirEnvVar: true,
+            excludeSlashTmp: true,
+          }
+        : {
+            type: "readOnly",
+            networkAccess: false,
+          },
     });
     const turnId = extractTurnId(turnResult, "turn/start");
     this.appServer.runtime.markTurnAccepted(threadId, turnId);
@@ -792,6 +888,8 @@ export class ControlSurface {
     const cursor = optionalInteger(args, "cursor", 0, Number.MAX_SAFE_INTEGER);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 50;
     const waitMs = optionalInteger(args, "wait_ms", 0, MAX_OBSERVE_WAIT_MS) ?? 0;
+    const storedThread = await this.#readAuthorizedThread(threadId, true);
+    throwIfAborted(signal);
     const runtime = waitMs === 0
       ? this.appServer.runtime.observe(threadId, cursor, limit)
       : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
@@ -799,11 +897,6 @@ export class ControlSurface {
     if (runtime) {
       return runtime;
     }
-    throwIfAborted(signal);
-    const result = await this.appServer.request("thread/read", {
-      threadId,
-      includeTurns: true,
-    });
     throwIfAborted(signal);
     return sanitizeForTransport({
       runtime_available: false,
@@ -818,8 +911,8 @@ export class ControlSurface {
       cursor_lost: false,
       has_more: false,
       pending_requests: [],
-      terminal: storedTerminal(result),
-      stored_thread: responseRecord(result, "thread/read").thread,
+      terminal: storedTerminal(storedThread),
+      stored_thread: storedThread.thread,
       source: "codex_app_server_thread_read",
     });
   }
@@ -829,6 +922,7 @@ export class ControlSurface {
     const threadId = requiredString(args, "thread_id", 200);
     const expectedTurnId = requiredString(args, "expected_turn_id", 200);
     const text = requiredString(args, "text");
+    await this.#readAuthorizedThread(threadId, false);
     const result = responseRecord(
       await this.appServer.request("turn/steer", {
         threadId,
@@ -859,7 +953,6 @@ export class ControlSurface {
       "turn_id",
       "method",
       "decision",
-      "execpolicy_amendment",
       "answers",
       "response",
     ]);
@@ -875,13 +968,25 @@ export class ControlSurface {
     const requestId = requestIdValue as RpcId;
     const threadId = requiredString(args, "thread_id", 200);
     const turnId = optionalString(args, "turn_id", 200);
-    const decision = enumValue(args, "decision", ["accept", "acceptForSession", "decline", "cancel"] as const);
-    const amendment = args.execpolicy_amendment;
+    const decision = enumValue(args, "decision", ["accept", "decline", "cancel"] as const);
     const answers = args.answers;
     const generic = args.response;
-    const supplied = [decision !== undefined, amendment !== undefined, answers !== undefined, generic !== undefined].filter(Boolean).length;
+    const supplied = [decision !== undefined, answers !== undefined, generic !== undefined].filter(Boolean).length;
     if (supplied !== 1) {
-      throw new Error("Provide exactly one of decision, execpolicy_amendment, answers, or response");
+      throw new Error("Provide exactly one of decision, answers, or response");
+    }
+
+    await this.#readAuthorizedThread(threadId, false);
+    const pending = this.appServer.runtime.peekPending(requestId, {
+      threadId,
+      method,
+      ...(turnId ? { turnId } : {}),
+    });
+    if (pending.turnId && !turnId) {
+      throw new Error("turn_id is required for this pending request");
+    }
+    if (decision === "accept") {
+      this.#guardApprovalAccept(method, pending);
     }
 
     let response: Record<string, unknown>;
@@ -891,43 +996,19 @@ export class ControlSurface {
       method === "execCommandApproval" ||
       method === "applyPatchApproval"
     ) {
-      if (amendment !== undefined) {
-        if (method !== "item/commandExecution/requestApproval" && method !== "execCommandApproval") {
-          throw new Error("execpolicy_amendment is valid only for command approval");
-        }
-        if (!Array.isArray(amendment) || amendment.length === 0 || amendment.some((item) => typeof item !== "string")) {
-          throw new Error("execpolicy_amendment must be a non-empty string array");
-        }
-        response = method === "execCommandApproval"
-          ? {
-              decision: {
-                approved_execpolicy_amendment: {
-                  proposed_execpolicy_amendment: amendment,
-                },
-              },
-            }
-          : {
-              decision: {
-                acceptWithExecpolicyAmendment: {
-                  execpolicy_amendment: amendment,
-                },
-              },
-            };
-      } else if (decision) {
+      if (decision) {
         if (method === "execCommandApproval" || method === "applyPatchApproval") {
           const legacyDecision = decision === "accept"
             ? "approved"
-            : decision === "acceptForSession"
-              ? "approved_for_session"
-              : decision === "cancel"
+            : decision === "cancel"
                 ? "abort"
-                : { denied: { rejection: "declined by MCP client" } };
+                : "denied";
           response = { decision: legacyDecision };
         } else {
           response = { decision };
         }
       } else {
-        throw new Error("Approval requests require decision or execpolicy_amendment");
+        throw new Error("Approval requests require decision");
       }
     } else if (method === "item/tool/requestUserInput") {
       response = answers !== undefined ? { answers: asObject(answers, "answers") } : asObject(generic, "response");
@@ -935,15 +1016,11 @@ export class ControlSurface {
       throw new Error(`Unsupported codex_respond method: ${method}`);
     }
 
-    const pending = this.appServer.runtime.takePending(requestId, {
+    this.appServer.runtime.takePending(requestId, {
       threadId,
       method,
       ...(turnId ? { turnId } : {}),
     });
-    if (pending.turnId && !turnId) {
-      this.appServer.runtime.restorePending(pending);
-      throw new Error("turn_id is required for this pending request");
-    }
     try {
       await this.appServer.respond(requestId, response);
     } catch (error) {
@@ -963,6 +1040,7 @@ export class ControlSurface {
     onlyKeys(args, ["thread_id", "turn_id"]);
     const threadId = requiredString(args, "thread_id", 200);
     const turnId = requiredString(args, "turn_id", 200);
+    await this.#readAuthorizedThread(threadId, false);
     await this.appServer.request("turn/interrupt", { threadId, turnId });
     return { interrupted: true, thread_id: threadId, turn_id: turnId };
   }

@@ -240,7 +240,7 @@ test("MCP rejects a duplicate active typed id without disturbing cancellation, c
         text: "test: hold bounded observe",
         cwd: fakeDirectory,
         sandbox: "read-only",
-        approval_policy: "never",
+        approval_policy: "on-request",
       },
     }));
     assert.equal(started.accepted, true);

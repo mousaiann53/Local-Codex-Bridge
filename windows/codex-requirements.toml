@@ -1,0 +1,4 @@
+# Hardened Local Codex Bridge managed ceiling.
+# Install as %ProgramData%\OpenAI\Codex\requirements.toml with administrator approval.
+allowed_approval_policies = ["untrusted", "on-request"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]

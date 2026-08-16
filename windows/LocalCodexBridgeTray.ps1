@@ -7,14 +7,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'TrayCore.psm1') -Force
 
-$readyUri = $null
-if (
-    [string]::IsNullOrWhiteSpace($ReadyUrl) -or
-    -not [Uri]::TryCreate($ReadyUrl, [UriKind]::Absolute, [ref]$readyUri) -or
-    @('http', 'https') -notcontains $readyUri.Scheme
-) {
-    throw 'ReadyUrl is required and must be an absolute HTTP(S) URL. Use -ReadyUrl or LOCAL_CODEX_BRIDGE_READY_URL.'
+if (-not (Test-LoopbackReadyUrl $ReadyUrl)) {
+    throw 'ReadyUrl is required and must be an absolute HTTP(S) loopback URL on 127.0.0.1, localhost, or ::1, without userinfo. Use -ReadyUrl or LOCAL_CODEX_BRIDGE_READY_URL.'
 }
 if ([string]::IsNullOrWhiteSpace($ProfileName) -or $ProfileName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw 'ProfileName is required and may contain only letters, numbers, dot, underscore, and hyphen. Use -ProfileName or LOCAL_CODEX_BRIDGE_TUNNEL_PROFILE.'
@@ -34,7 +30,6 @@ if (-not [IO.Path]::IsPathRooted($ProjectionPath)) {
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Import-Module (Join-Path $PSScriptRoot 'TrayCore.psm1') -Force
 
 $script:Ownership = $null
 $script:Cursor = New-ProjectionCursor

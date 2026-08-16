@@ -18,6 +18,26 @@ lines.on("line", (line) => {
     setTimeout(() => lines.resume(), 120);
     return;
   }
+  if (message.method === "initialized") {
+    if (Object.hasOwn(message, "params")) process.exit(65);
+    return;
+  }
+  if (message.method === "configRequirements/read") {
+    if (Object.hasOwn(message, "params") && message.params !== null) {
+      send({ id: message.id, error: { code: -32602, message: "configRequirements/read params must be omitted or null" } });
+      return;
+    }
+    send({
+      id: message.id,
+      result: {
+        requirements: {
+          allowedApprovalPolicies: ["untrusted", "on-request"],
+          allowedSandboxModes: ["read-only", "workspace-write"],
+        },
+      },
+    });
+    return;
+  }
   if (message.method === "test/after") {
     send({ id: message.id, result: { after: true } });
   }
