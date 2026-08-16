@@ -39,7 +39,7 @@ Local Codex Bridge
 | 工具 | 用途 | 重要边界 |
 | --- | --- | --- |
 | `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | `cwd` 和搜索词只是筛选条件，不是权限边界；不会重建已经丢失的 Bridge 实时事件 |
-| `codex_turn` | 新建或恢复线程，并启动一个回合 | 新线程必须提供绝对 Windows 盘符路径；返回“已接受”不等于任务完成 |
+| `codex_turn` | 新建或恢复线程，并启动一个回合 | effective cwd 必须位于 `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS`；返回“已接受”不等于任务完成 |
 | `codex_observe` | 读取有界的实时事件、待处理请求、终态和游标 | `wait_ms` 最长 10 秒，只做一次事件驱动等待；安静不代表卡死 |
 | `codex_steer` | 向同一个活动回合追加纠正或新意图 | 必须匹配准确的 `thread_id` 和 `expected_turn_id`；不会新建回合 |
 | `codex_respond` | 回答真实的审批、用户输入、权限或 elicitation 请求 | 必须使用原始 request ID 及准确的线程、方法和回合范围；不能虚构请求 |
@@ -77,8 +77,13 @@ npm test
 
 ```powershell
 $env:CODEX_EXE = 'C:\path\to\codex.exe' # codex 已在 PATH 时可省略
+$env:LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS = 'D:\Work\Repo;D:\Work\Repo\.worktrees\task'
 npm start
 ```
+
+`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` 是 `codex_turn` 的强制授权根目录列表，多个现存目录以分号分隔。未配置或配置为空时，Bridge 会 fail closed 并禁用所有 `codex_turn`。新线程 cwd、恢复线程的 cwd override，以及未提供 override 时从 `thread/read` 取得的持久 cwd，都会先解析为真实目录，再按 Windows 目录 identity 的 ancestor 关系检查，而不是比较字符串前缀；UNC、device path、根外 `..` 逃逸及解析到根外的 symlink/junction 都会被拒绝。
+
+这一检查只负责回合启动时的 workspace root 边界，不替代 Codex 的 OS sandbox，也不等于完整的 thread authorization gate。
 
 接入 MCP 客户端时，请把 stdio 命令直接配置为：
 
@@ -86,6 +91,7 @@ npm start
 command: node
 args:    C:\absolute\path\to\Local-Codex-Bridge\dist\src\index.js
 env:     CODEX_EXE=C:\path\to\codex.exe   # 可选
+         LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS=D:\Work\Repo;D:\Work\Repo\.worktrees\task
 ```
 
 不同客户端的配置文件格式并不相同，但最终应直接运行 `node dist/src/index.js`。不要在 Secure MCP Tunnel 或其他严格的 JSON-RPC stdio 客户端后面使用 `npm start`，因为 npm 生命周期输出可能污染 stdout 协议流。

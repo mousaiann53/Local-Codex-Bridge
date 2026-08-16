@@ -10,6 +10,7 @@ import {
   writeWithBackpressure,
 } from "../src/app-server.js";
 import { ControlSurface } from "../src/tools.js";
+import { WorkspaceRootPolicy } from "../src/workspace-roots.js";
 
 const fakeCodex = fileURLToPath(new URL("../../test/fake-codex.mjs", import.meta.url));
 const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.mjs", import.meta.url));
@@ -68,11 +69,15 @@ test("control surface starts asynchronously, steers the same turn, uses raw requ
     prefixArgs: [fakeCodex],
     requestTimeoutMs: 2_000,
   });
-  const control = new ControlSurface(manager);
+  const control = new ControlSurface(
+    manager,
+    undefined,
+    new WorkspaceRootPolicy([process.cwd()]),
+  );
   try {
     const started = await control.call("codex_turn", {
       text: "read only",
-      cwd: "D:\\Bridge",
+      cwd: process.cwd(),
       sandbox: "read-only",
       approval_policy: "never",
     }) as Record<string, unknown>;

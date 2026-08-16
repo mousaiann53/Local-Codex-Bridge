@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { CHECKPOINT_DIRECTORY_ENV } from "../src/checkpoint.js";
+import { ALLOWED_ROOTS_ENV } from "../src/workspace-roots.js";
 
 type RpcId = string | number;
 
@@ -229,6 +230,7 @@ test("MCP rejects a duplicate active typed id without disturbing cancellation, c
   const client = new TestClient({
     ...process.env,
     CODEX_EXE: process.execPath,
+    [ALLOWED_ROOTS_ENV]: fakeDirectory,
   }, fakeDirectory);
   try {
     await initialize(client, 1);
@@ -332,6 +334,32 @@ test("MCP rejects materially different repeated initialize identities", async ()
       assert.equal(error.code, -32602);
       assert.match(error.message as string, new RegExp(field));
     }
+  } finally {
+    assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP rejects codex_turn before app-server launch when allowed roots are unset", async () => {
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_EXE: "Z:\\definitely-missing\\codex.exe",
+  };
+  delete environment[ALLOWED_ROOTS_ENV];
+  const client = new TestClient(environment);
+  try {
+    await initialize(client, 1);
+    const response = await client.request(2, "tools/call", {
+      name: "codex_turn",
+      arguments: {
+        text: "must remain blocked",
+        cwd: process.cwd(),
+      },
+    });
+    const result = response.result as Record<string, unknown>;
+    assert.equal(result.isError, true);
+    const content = result.content as Array<Record<string, unknown>>;
+    assert.match(content[0]?.text as string, new RegExp(ALLOWED_ROOTS_ENV));
+    assert.doesNotMatch(content[0]?.text as string, /Failed to spawn/);
   } finally {
     assert.equal(await client.close(), 0);
   }

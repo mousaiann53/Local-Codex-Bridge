@@ -1,5 +1,3 @@
-import path from "node:path";
-
 import { AppServerManager } from "./app-server.js";
 import {
   CHECKPOINT_TEXT_LIMIT,
@@ -11,6 +9,12 @@ import {
   sanitizeForTransport,
   type RpcId,
 } from "./runtime.js";
+import {
+  WorkspaceRootPolicy,
+  validateWindowsCwd,
+} from "./workspace-roots.js";
+
+export { validateWindowsCwd } from "./workspace-roots.js";
 
 export interface ToolDefinition {
   name: string;
@@ -102,7 +106,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
+      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS must authorize the effective cwd; resume without a cwd override validates the thread's persisted cwd first. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,7 +123,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         cwd: {
           type: "string",
-          description: "Absolute Windows drive-letter cwd. Required for a new thread; optional override for resume.",
+          description: "Absolute Windows drive-letter cwd inside a configured allowed root. Required for a new thread; optional authorized override for resume.",
         },
         model: {
           type: "string",
@@ -474,19 +478,6 @@ function enumValue<T extends string>(
   return value as T;
 }
 
-export function validateWindowsCwd(value: string): string {
-  if (value.includes("\0")) {
-    throw new Error("cwd contains a NUL character");
-  }
-  if (/^(?:\\\\|\/\/|\\\\[?.]\\|\\[?.]\\)/.test(value)) {
-    throw new Error("cwd must not be a UNC or Windows device path");
-  }
-  if (!/^[A-Za-z]:[\\/]/.test(value) || !path.win32.isAbsolute(value)) {
-    throw new Error("cwd must be an absolute Windows drive-letter path");
-  }
-  return path.win32.normalize(value);
-}
-
 function responseRecord(value: unknown, method: string): Record<string, unknown> {
   const record = asObject(value, `${method} response`);
   return record;
@@ -498,6 +489,14 @@ function extractThreadId(result: unknown, method: string): string {
     throw new Error(`${method} returned no thread id`);
   }
   return thread.id;
+}
+
+function extractThreadCwd(result: unknown): string {
+  const thread = asObject(asObject(result, "thread/read result").thread, "thread/read result.thread");
+  if (typeof thread.cwd !== "string" || thread.cwd.length === 0) {
+    throw new Error("thread/read returned no cwd");
+  }
+  return thread.cwd;
 }
 
 function extractTurnId(result: unknown, method: string): string {
@@ -557,6 +556,7 @@ export class ControlSurface {
   constructor(
     private readonly appServer: AppServerManager,
     checkpoints?: CheckpointStore,
+    private readonly workspaceRoots = WorkspaceRootPolicy.fromEnvironment(),
   ) {
     this.checkpoints = checkpoints;
   }
@@ -728,7 +728,15 @@ export class ControlSurface {
     if (!requestedThreadId && !cwdInput) {
       throw new Error("cwd is required when thread_id is omitted");
     }
-    const cwd = cwdInput ? validateWindowsCwd(cwdInput) : undefined;
+    this.workspaceRoots.requireConfigured();
+    let cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
+    if (requestedThreadId && !cwd) {
+      const storedThread = await this.appServer.request("thread/read", {
+        threadId: requestedThreadId,
+        includeTurns: false,
+      });
+      cwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(storedThread));
+    }
     const model = optionalString(args, "model", 100);
     const effort = optionalString(args, "effort", 32);
     const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write", "danger-full-access"] as const);

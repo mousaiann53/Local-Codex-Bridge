@@ -1,4 +1,16 @@
 import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  mkdirSync,
+  lstatSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
@@ -14,6 +26,10 @@ import {
   TOOL_DEFINITIONS,
   validateWindowsCwd,
 } from "../src/tools.js";
+import {
+  ALLOWED_ROOTS_ENV,
+  WorkspaceRootPolicy,
+} from "../src/workspace-roots.js";
 
 async function within<T>(promise: Promise<T>, milliseconds = 150): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -71,6 +87,222 @@ test("cwd check accepts drive paths and rejects UNC/device/relative paths", () =
   assert.throws(() => validateWindowsCwd("relative\\path"), /drive-letter/);
   assert.throws(() => validateWindowsCwd("\\\\server\\share"), /UNC or Windows device/);
   assert.throws(() => validateWindowsCwd("\\\\?\\D:\\Bridge"), /UNC or Windows device/);
+});
+
+test("workspace roots canonicalize real directories and reject traversal and reparse escapes", () => {
+  const testDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-roots-"));
+  try {
+    const allowedRoot = join(testDirectory, "Allowed");
+    const inside = join(allowedRoot, "inside");
+    const outside = join(testDirectory, "Allowed-neighbor");
+    mkdirSync(inside, { recursive: true });
+    mkdirSync(outside);
+
+    const policy = new WorkspaceRootPolicy([allowedRoot]);
+    assert.equal(
+      policy.authorizeCwd(inside.toUpperCase()),
+      realpathSync.native(inside),
+      "Windows authorization must be case-insensitive and return the canonical path",
+    );
+    assert.equal(
+      policy.authorizeCwd(`${inside}\\..\\inside`),
+      realpathSync.native(inside),
+    );
+    assert.throws(
+      () => policy.authorizeCwd(`${allowedRoot}\\..\\Allowed-neighbor`),
+      /outside the configured allowed roots/,
+    );
+    assert.throws(
+      () => policy.authorizeCwd(outside),
+      /outside the configured allowed roots/,
+      "a neighboring path with the same prefix must not be authorized",
+    );
+
+    const insideJunction = join(allowedRoot, "inside-junction");
+    symlinkSync(inside, insideJunction, "junction");
+    assert.equal(policy.authorizeCwd(insideJunction), realpathSync.native(inside));
+
+    const escapingJunction = join(allowedRoot, "escape-junction");
+    symlinkSync(outside, escapingJunction, "junction");
+    assert.equal(lstatSync(escapingJunction).isSymbolicLink(), true);
+    const outsideChild = join(outside, "child");
+    mkdirSync(outsideChild);
+    assert.throws(
+      () => policy.authorizeCwd(join(escapingJunction, "child")),
+      /outside the configured allowed roots/,
+    );
+
+    const filePath = join(allowedRoot, "not-a-directory.txt");
+    writeFileSync(filePath, "fixture", "utf8");
+    assert.throws(
+      () => policy.authorizeCwd(filePath),
+      /must resolve to an existing local directory/,
+    );
+    assert.throws(
+      () => policy.authorizeCwd(join(allowedRoot, "missing")),
+      /must resolve to an existing local directory/,
+    );
+
+    const fromEnvironment = WorkspaceRootPolicy.fromEnvironment({
+      [ALLOWED_ROOTS_ENV]: `${allowedRoot};${outside}`,
+    });
+    assert.equal(fromEnvironment.authorizeCwd(outside), realpathSync.native(outside));
+    for (const emptyValue of [undefined, "", "   ", "; ;"]) {
+      const environment: NodeJS.ProcessEnv = {};
+      if (emptyValue !== undefined) {
+        environment[ALLOWED_ROOTS_ENV] = emptyValue;
+      }
+      assert.throws(
+        () => WorkspaceRootPolicy.fromEnvironment(environment).authorizeCwd(inside),
+        new RegExp(ALLOWED_ROOTS_ENV),
+      );
+    }
+    assert.throws(
+      () => new WorkspaceRootPolicy([join(testDirectory, "missing-root")]),
+      /must resolve to an existing local directory/,
+    );
+
+    const replacedRoot = join(testDirectory, "replaced-root");
+    const movedRoot = join(testDirectory, "moved-root");
+    mkdirSync(replacedRoot);
+    const replacementPolicy = new WorkspaceRootPolicy([replacedRoot]);
+    renameSync(replacedRoot, movedRoot);
+    mkdirSync(replacedRoot);
+    assert.throws(
+      () => replacementPolicy.authorizeCwd(replacedRoot),
+      /configured allowed root changed or became unavailable/,
+    );
+  } finally {
+    rmSync(testDirectory, { recursive: true, force: true });
+  }
+});
+
+test("codex_turn fails closed without roots and authorizes persisted resume cwd before mutation", async () => {
+  const testDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-turn-roots-"));
+  try {
+    const allowedRoot = join(testDirectory, "allowed");
+    const allowedCwd = join(allowedRoot, "workspace");
+    const outsideCwd = join(testDirectory, "outside");
+    mkdirSync(allowedCwd, { recursive: true });
+    mkdirSync(outsideCwd);
+
+    const blockedCalls: string[] = [];
+    const blockedManager = {
+      runtime: new RuntimeStore(),
+      request: async (method: string): Promise<unknown> => {
+        blockedCalls.push(method);
+        throw new Error("unexpected native request");
+      },
+    } as unknown as AppServerManager;
+    const blocked = new ControlSurface(
+      blockedManager,
+      undefined,
+      new WorkspaceRootPolicy([]),
+    );
+    await assert.rejects(
+      blocked.call("codex_turn", { text: "blocked", cwd: allowedCwd }),
+      new RegExp(ALLOWED_ROOTS_ENV),
+    );
+    await assert.rejects(
+      blocked.call("codex_turn", { text: "blocked resume", thread_id: "stored-thread" }),
+      new RegExp(ALLOWED_ROOTS_ENV),
+    );
+    assert.deepEqual(blockedCalls, []);
+
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    let persistedCwd = allowedCwd;
+    const manager = {
+      runtime: new RuntimeStore(),
+      request: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { id: "stored-thread", cwd: persistedCwd } };
+        }
+        if (method === "thread/resume") {
+          return { thread: { id: "stored-thread" } };
+        }
+        if (method === "thread/start") {
+          return { thread: { id: "new-thread" } };
+        }
+        if (method === "turn/start") {
+          return { turn: { id: "turn-1", status: "inProgress" } };
+        }
+        throw new Error(`unexpected method: ${method}`);
+      },
+    } as unknown as AppServerManager;
+    const control = new ControlSurface(
+      manager,
+      undefined,
+      new WorkspaceRootPolicy([allowedRoot]),
+    );
+
+    const started = await control.call("codex_turn", {
+      text: "resume safely",
+      thread_id: "stored-thread",
+    }) as Record<string, unknown>;
+    assert.equal(started.accepted, true);
+    assert.deepEqual(calls.map((call) => call.method), [
+      "thread/read",
+      "thread/resume",
+      "turn/start",
+    ]);
+    const canonicalCwd = realpathSync.native(allowedCwd);
+    assert.equal(calls[0]?.params.threadId, "stored-thread");
+    assert.equal(calls[0]?.params.includeTurns, false);
+    assert.equal(calls[1]?.params.cwd, canonicalCwd);
+    assert.equal(calls[2]?.params.cwd, canonicalCwd);
+
+    calls.length = 0;
+    const explicitResume = await control.call("codex_turn", {
+      text: "resume with an explicit safe cwd",
+      thread_id: "stored-thread",
+      cwd: allowedCwd,
+    }) as Record<string, unknown>;
+    assert.equal(explicitResume.accepted, true);
+    assert.deepEqual(calls.map((call) => call.method), ["thread/resume", "turn/start"]);
+    assert.equal(calls[0]?.params.cwd, canonicalCwd);
+    assert.equal(calls[1]?.params.cwd, canonicalCwd);
+
+    calls.length = 0;
+    const newThread = await control.call("codex_turn", {
+      text: "start inside the allowed root",
+      cwd: allowedCwd,
+    }) as Record<string, unknown>;
+    assert.equal(newThread.accepted, true);
+    assert.deepEqual(calls.map((call) => call.method), ["thread/start", "turn/start"]);
+    assert.equal(calls[0]?.params.cwd, canonicalCwd);
+    assert.equal(calls[1]?.params.cwd, canonicalCwd);
+
+    calls.length = 0;
+    await assert.rejects(
+      control.call("codex_turn", {
+        text: "reject unsafe override",
+        thread_id: "stored-thread",
+        cwd: outsideCwd,
+      }),
+      /outside the configured allowed roots/,
+    );
+    assert.equal(calls.length, 0);
+
+    await assert.rejects(
+      control.call("codex_turn", { text: "reject unsafe new thread", cwd: outsideCwd }),
+      /outside the configured allowed roots/,
+    );
+    assert.equal(calls.length, 0);
+
+    calls.length = 0;
+    persistedCwd = outsideCwd;
+    await assert.rejects(
+      control.call("codex_turn", {
+        text: "reject unsafe resume",
+        thread_id: "stored-thread",
+      }),
+      /outside the configured allowed roots/,
+    );
+    assert.deepEqual(calls.map((call) => call.method), ["thread/read"]);
+  } finally {
+    rmSync(testDirectory, { recursive: true, force: true });
+  }
 });
 
 test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures terminal output", () => {
