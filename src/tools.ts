@@ -688,6 +688,26 @@ export class ControlSurface {
     return responseRecord(result, "thread/read");
   }
 
+  #authorizeBoundLiveThread(threadId: string): boolean {
+    this.workspaceRoots.requireConfigured();
+    const boundCwd = this.appServer.runtime.authorizedWorkspace(threadId);
+    if (!boundCwd || !this.appServer.runtime.hasThread(threadId)) {
+      return false;
+    }
+    const authorizedCwd = this.workspaceRoots.authorizeCwd(boundCwd);
+    if (authorizedCwd.toLowerCase() !== boundCwd.toLowerCase()) {
+      throw new Error("live thread workspace binding no longer resolves to the authorized cwd");
+    }
+    this.appServer.runtime.bindAuthorizedWorkspace(threadId, authorizedCwd);
+    return true;
+  }
+
+  async #authorizeControlThread(threadId: string): Promise<void> {
+    if (!this.#authorizeBoundLiveThread(threadId)) {
+      await this.#readAuthorizedThread(threadId, false);
+    }
+  }
+
   #guardApprovalAccept(
     method: string,
     pending: PendingServerRequest,
@@ -888,11 +908,18 @@ export class ControlSurface {
     const cursor = optionalInteger(args, "cursor", 0, Number.MAX_SAFE_INTEGER);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 50;
     const waitMs = optionalInteger(args, "wait_ms", 0, MAX_OBSERVE_WAIT_MS) ?? 0;
-    const storedThread = await this.#readAuthorizedThread(threadId, true);
-    throwIfAborted(signal);
-    const runtime = waitMs === 0
+    const observeRuntime = async (): Promise<unknown> => waitMs === 0
       ? this.appServer.runtime.observe(threadId, cursor, limit)
       : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
+    if (this.#authorizeBoundLiveThread(threadId)) {
+      const runtime = await observeRuntime();
+      throwIfAborted(signal);
+      if (runtime) {
+        return runtime;
+      }
+    }
+    const storedThread = await this.#readAuthorizedThread(threadId, true);
+    const runtime = await observeRuntime();
     throwIfAborted(signal);
     if (runtime) {
       return runtime;
@@ -922,7 +949,7 @@ export class ControlSurface {
     const threadId = requiredString(args, "thread_id", 200);
     const expectedTurnId = requiredString(args, "expected_turn_id", 200);
     const text = requiredString(args, "text");
-    await this.#readAuthorizedThread(threadId, false);
+    await this.#authorizeControlThread(threadId);
     const result = responseRecord(
       await this.appServer.request("turn/steer", {
         threadId,
@@ -976,7 +1003,7 @@ export class ControlSurface {
       throw new Error("Provide exactly one of decision, answers, or response");
     }
 
-    await this.#readAuthorizedThread(threadId, false);
+    await this.#authorizeControlThread(threadId);
     const pending = this.appServer.runtime.peekPending(requestId, {
       threadId,
       method,
@@ -1040,7 +1067,7 @@ export class ControlSurface {
     onlyKeys(args, ["thread_id", "turn_id"]);
     const threadId = requiredString(args, "thread_id", 200);
     const turnId = requiredString(args, "turn_id", 200);
-    await this.#readAuthorizedThread(threadId, false);
+    await this.#authorizeControlThread(threadId);
     await this.appServer.request("turn/interrupt", { threadId, turnId });
     return { interrupted: true, thread_id: threadId, turn_id: turnId };
   }

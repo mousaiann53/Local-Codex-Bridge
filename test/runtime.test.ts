@@ -490,6 +490,22 @@ test("thread access gate hides outside threads and remote permission inputs fail
     });
 
     calls.length = 0;
+    const liveObserved = await control.call("codex_observe", {
+      thread_id: "new-thread",
+      cursor: 0,
+    }) as Record<string, unknown>;
+    assert.equal(liveObserved.runtime_status, "inProgress");
+    assert.equal(calls.length, 0);
+
+    const liveSteered = await control.call("codex_steer", {
+      thread_id: "new-thread",
+      expected_turn_id: "new-turn",
+      text: "continue the live turn",
+    }) as Record<string, unknown>;
+    assert.equal(liveSteered.turn_id, "new-turn");
+    assert.deepEqual(calls.map((call) => call.method), ["turn/steer"]);
+
+    calls.length = 0;
     await control.call("codex_turn", {
       text: "restricted workspace write",
       cwd: allowedCwd,
