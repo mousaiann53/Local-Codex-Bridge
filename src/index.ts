@@ -1,5 +1,6 @@
 import { AppServerManager } from "./app-server.js";
 import { McpStdioServer } from "./mcp.js";
+import { ProjectRegistry } from "./project-registry.js";
 import { sanitizeForTransport } from "./runtime.js";
 import { RuntimeStore } from "./runtime.js";
 import { ControlSurface } from "./tools.js";
@@ -7,7 +8,7 @@ import { createUxProjectionFromEnvironment } from "./ux-projection.js";
 
 const uxProjection = createUxProjectionFromEnvironment();
 const appServer = new AppServerManager(new RuntimeStore(256, uxProjection));
-const control = new ControlSurface(appServer);
+const control = new ControlSurface(appServer, undefined, new ProjectRegistry());
 
 let shuttingDown = false;
 let server: McpStdioServer;

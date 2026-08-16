@@ -13,6 +13,7 @@ import {
 import {
   WorkspaceRootPolicy,
 } from "./workspace-roots.js";
+import type { ProjectRecord } from "./project-registry.js";
 
 export { validateWindowsCwd } from "./workspace-roots.js";
 
@@ -57,7 +58,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List or search persistent local Codex threads through thread/list, or read one thread through thread/read. This does not reconstruct live Bridge events.",
+      "List/search/read persistent native Codex threads whose Git project is enabled in the Local Codex Bridge Project Registry. Supports project_id and cwd filters, and returns project_id for every visible thread. This does not reconstruct live Bridge events.",
     inputSchema: {
       type: "object",
       properties: {
@@ -74,6 +75,12 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cwd: {
           type: "string",
           description: "Optional exact absolute Windows drive-letter cwd filter for thread/list.",
+        },
+        project_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+          description: "Optional enabled Local Codex Bridge project id filter for thread/list.",
         },
         search_term: {
           type: "string",
@@ -108,7 +115,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS must authorize the effective cwd; resume without a cwd override validates the thread's persisted cwd first. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
+      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. An enabled Local Codex Bridge Project Registry entry must authorize the effective cwd; LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS, when configured, is only an additional static ceiling. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
     inputSchema: {
       type: "object",
       properties: {
@@ -486,6 +493,15 @@ function extractThreadId(result: unknown, method: string): string {
   return thread.id;
 }
 
+export interface WorkspaceAuthorizationPolicy {
+  requireConfigured(): void;
+  authorizeCwd(value: string): string;
+  authorizeTargetPath(value: string, cwd?: string): string;
+  discoverCwd?(value: string, source: string): ProjectRecord | null;
+  projectForCwd?(value: string, enabledOnly?: boolean): ProjectRecord | null;
+  projectById?(projectId: string): ProjectRecord | null;
+}
+
 function extractThreadCwd(result: unknown): string {
   const thread = asObject(asObject(result, "thread/read result").thread, "thread/read result.thread");
   if (typeof thread.cwd !== "string" || thread.cwd.length === 0) {
@@ -551,7 +567,7 @@ export class ControlSurface {
   constructor(
     private readonly appServer: AppServerManager,
     checkpoints?: CheckpointStore,
-    private readonly workspaceRoots = WorkspaceRootPolicy.fromEnvironment(),
+    private readonly workspaceRoots: WorkspaceAuthorizationPolicy = WorkspaceRootPolicy.fromEnvironment(),
   ) {
     this.checkpoints = checkpoints;
   }
@@ -666,23 +682,70 @@ export class ControlSurface {
     return this.checkpoints;
   }
 
-  #bindAuthorizedThread(threadId: string, result: unknown): string {
+  #discoverCwd(value: string, source: string): void {
+    this.workspaceRoots.discoverCwd?.(value, source);
+  }
+
+  #projectForCwd(cwd: string): ProjectRecord | null {
+    return this.workspaceRoots.projectForCwd?.(cwd, true) ?? null;
+  }
+
+  #authorizeProjectCwd(
+    value: string,
+    discoveredFrom?: string,
+  ): { cwd: string; projectId: string | null } {
+    if (discoveredFrom) this.#discoverCwd(value, discoveredFrom);
+    const cwd = this.workspaceRoots.authorizeCwd(value);
+    const project = this.#projectForCwd(cwd);
+    if (this.workspaceRoots.projectForCwd && !project) {
+      throw new Error("cwd does not belong to an enabled project");
+    }
+    return { cwd, projectId: project?.project_id ?? null };
+  }
+
+  #enabledProject(projectId: string): ProjectRecord {
+    if (!this.workspaceRoots.projectById) {
+      throw new Error("project_id filtering requires the Local Codex Bridge Project Registry");
+    }
+    const project = this.workspaceRoots.projectById(projectId);
+    if (!project || !project.enabled) {
+      throw new Error("project_id does not identify an enabled project");
+    }
+    this.workspaceRoots.authorizeCwd(project.canonical_root);
+    return project;
+  }
+
+  #bindAuthorizedThread(
+    threadId: string,
+    result: unknown,
+  ): { cwd: string; projectId: string | null } {
     if (extractThreadId(result, "thread/read") !== threadId) {
       throw new Error("thread/read returned a different thread id");
     }
-    const cwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(result));
+    const authorization = this.#authorizeProjectCwd(extractThreadCwd(result), "codex_thread");
+    const cwd = authorization.cwd;
     this.appServer.runtime.bindAuthorizedWorkspace(threadId, cwd);
-    return cwd;
+    return authorization;
   }
 
   async #readAuthorizedThread(
     threadId: string,
     includeTurns: boolean,
   ): Promise<Record<string, unknown>> {
-    this.workspaceRoots.requireConfigured();
+    if (!this.workspaceRoots.discoverCwd) {
+      this.workspaceRoots.requireConfigured();
+    }
+    const metadata = await this.appServer.request("thread/read", {
+      threadId,
+      includeTurns: false,
+    });
+    this.#bindAuthorizedThread(threadId, metadata);
+    if (!includeTurns) {
+      return responseRecord(metadata, "thread/read");
+    }
     const result = await this.appServer.request("thread/read", {
       threadId,
-      includeTurns,
+      includeTurns: true,
     });
     this.#bindAuthorizedThread(threadId, result);
     return responseRecord(result, "thread/read");
@@ -694,7 +757,7 @@ export class ControlSurface {
     if (!boundCwd || !this.appServer.runtime.hasThread(threadId)) {
       return false;
     }
-    const authorizedCwd = this.workspaceRoots.authorizeCwd(boundCwd);
+    const authorizedCwd = this.#authorizeProjectCwd(boundCwd).cwd;
     if (authorizedCwd.toLowerCase() !== boundCwd.toLowerCase()) {
       throw new Error("live thread workspace binding no longer resolves to the authorized cwd");
     }
@@ -762,22 +825,44 @@ export class ControlSurface {
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "cwd", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
-      if (args.cwd !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
+      if (args.cwd !== undefined || args.project_id !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
         throw new Error("thread_id cannot be combined with list/search fields");
       }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
       const result = await this.#readAuthorizedThread(threadId, includeTurns);
-      return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...result });
+      const thread = asObject(result.thread, "thread/read result.thread");
+      const projectId = this.#projectForCwd(extractThreadCwd(result))?.project_id ?? null;
+      return sanitizeForTransport({
+        source: "codex_app_server",
+        mode: "read",
+        ...result,
+        project_id: projectId,
+        thread: { ...thread, project_id: projectId },
+      });
     }
     if (args.include_turns !== undefined) {
       throw new Error("include_turns is valid only with thread_id");
     }
-    this.workspaceRoots.requireConfigured();
+    if (!this.workspaceRoots.discoverCwd) {
+      this.workspaceRoots.requireConfigured();
+    }
+    const projectId = optionalString(args, "project_id", 200);
+    const projectFilter = projectId ? this.#enabledProject(projectId) : undefined;
     const cwdInput = optionalString(args, "cwd", 1_000);
-    const cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
+    const cwdAuthorization = cwdInput
+      ? this.#authorizeProjectCwd(cwdInput)
+      : undefined;
+    const cwd = cwdAuthorization?.cwd;
+    if (
+      projectFilter &&
+      cwdAuthorization?.projectId &&
+      cwdAuthorization.projectId !== projectFilter.project_id
+    ) {
+      throw new Error("cwd does not belong to the requested project_id");
+    }
     const searchTerm = optionalString(args, "search_term", 500);
     const cursor = optionalString(args, "cursor", 10_000);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 20;
@@ -799,9 +884,19 @@ export class ControlSurface {
         if (typeof thread.id !== "string" || thread.id.length === 0) {
           return [];
         }
-        const authorizedCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd({ thread }));
+        const authorization = this.#authorizeProjectCwd(
+          extractThreadCwd({ thread }),
+          "codex_thread",
+        );
+        if (projectFilter && authorization.projectId !== projectFilter.project_id) {
+          return [];
+        }
+        const authorizedCwd = authorization.cwd;
         this.appServer.runtime.bindAuthorizedWorkspace(thread.id, authorizedCwd);
-        return [sanitizeForTransport(thread, {
+        return [sanitizeForTransport({
+          ...thread,
+          project_id: authorization.projectId,
+        }, {
           maxStringChars: 4_000,
           maxDepth: 6,
           maxArrayItems: 20,
@@ -834,12 +929,25 @@ export class ControlSurface {
     const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write"] as const) ?? "read-only";
     const approvalPolicy = enumValue(args, "approval_policy", ["untrusted", "on-request"] as const) ?? "untrusted";
     this.workspaceRoots.requireConfigured();
-    let cwd = cwdInput ? this.workspaceRoots.authorizeCwd(cwdInput) : undefined;
+    let cwdAuthorization = cwdInput
+      ? this.#authorizeProjectCwd(cwdInput)
+      : undefined;
     if (requestedThreadId) {
       const storedThread = await this.#readAuthorizedThread(requestedThreadId, false);
-      const persistedCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(storedThread));
-      cwd ??= persistedCwd;
+      const persistedAuthorization = this.#authorizeProjectCwd(
+        extractThreadCwd(storedThread),
+        "codex_thread",
+      );
+      if (
+        cwdAuthorization?.projectId &&
+        persistedAuthorization.projectId &&
+        cwdAuthorization.projectId !== persistedAuthorization.projectId
+      ) {
+        throw new Error("resume cwd override must remain in the thread's authorized project");
+      }
+      cwdAuthorization ??= persistedAuthorization;
     }
+    const cwd = cwdAuthorization!.cwd;
     const overrides = {
       cwd,
       ...(model ? { model } : {}),
@@ -864,8 +972,12 @@ export class ControlSurface {
       throw new Error("thread/resume returned a different thread id");
     }
     const resumedThread = await this.#readAuthorizedThread(threadId, false);
-    const effectiveCwd = this.workspaceRoots.authorizeCwd(extractThreadCwd(resumedThread));
-    if (effectiveCwd.toLowerCase() !== cwd!.toLowerCase()) {
+    const effectiveAuthorization = this.#authorizeProjectCwd(
+      extractThreadCwd(resumedThread),
+      "codex_thread",
+    );
+    const effectiveCwd = effectiveAuthorization.cwd;
+    if (effectiveCwd.toLowerCase() !== cwd.toLowerCase()) {
       throw new Error("native thread cwd does not match the authorized requested cwd");
     }
     this.appServer.runtime.bindAuthorizedWorkspace(threadId, effectiveCwd);
@@ -896,6 +1008,7 @@ export class ControlSurface {
       accepted: true,
       thread_id: threadId,
       turn_id: turnId,
+      project_id: effectiveAuthorization.projectId,
       event_cursor: this.appServer.runtime.currentCursor(threadId),
       status: typeof turn.status === "string" ? turn.status : "inProgress",
     };

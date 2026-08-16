@@ -2,9 +2,9 @@
 
 ## Project intent
 
-Local Codex Bridge is a thin Windows-oriented MCP stdio control surface for native Codex sessions. Its purpose is to let ChatGPT or another MCP client supervise official Codex threads without creating a second task system, transcript store, queue, retry loop, or authority layer.
+Local Codex Bridge is a thin Windows-oriented MCP stdio control surface for native Codex sessions. Its purpose is to let ChatGPT or another MCP client supervise official Codex threads across multiple explicitly authorized local Git projects without creating a second task system, transcript store, queue, or retry loop. The persistent Project Registry is the Bridge-owned project authorization layer; native Codex remains the owner of threads, turns, history, and execution.
 
-Keep the bridge thin. Native Codex owns persistent threads, turns, history, final messages, and execution capabilities. Bridge-owned state is limited to bounded live supervision data, pending requests, terminal snapshots, optional bounded checkpoints, and the optional UX projection.
+Keep the bridge thin. Native Codex owns persistent threads, turns, history, final messages, and execution capabilities. Bridge-owned state is limited to the Project Registry, bounded live supervision data, pending requests, terminal snapshots, optional bounded checkpoints, and the optional UX projection.
 
 ## Architecture
 
@@ -16,11 +16,11 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
            -> native Codex sessions
 ```
 
-`src/mcp.ts` owns the MCP boundary, `src/app-server.ts` owns the official child-process protocol, `src/tools.ts` owns the public tool contract, and `src/runtime.ts` owns ephemeral live state. `src/checkpoint.ts` provides the separate optional local checkpoint store. The Windows Tray and Secure MCP Tunnel integration are optional layers; the Tunnel itself is external to this repository.
+`src/mcp.ts` owns the MCP boundary, `src/app-server.ts` owns the official child-process protocol, `src/tools.ts` owns the public tool contract, `src/project-registry.ts` owns project authorization state and Git/worktree identity, and `src/runtime.ts` owns ephemeral live state. `src/checkpoint.ts` provides the separate optional local checkpoint store. The Windows Tray and Secure MCP Tunnel integration are optional layers; the Tunnel itself is external to this repository.
 
 The seven public tools have distinct semantics:
 
-- `codex_threads`: list/search/read only persistent native threads whose persisted cwd passes the authorized-root gate.
+- `codex_threads`: list/search/read only persistent native threads whose persisted cwd belongs to an enabled Project Registry entry; list results include `project_id`.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
@@ -35,6 +35,8 @@ Preserve these distinctions, the tool names, validation, annotations, and stdout
 The Bridge is not an OS sandbox and must not claim to be one. Codex permissions come from the official runtime plus the selected sandbox and approval policy. Prompts constrain intended behavior; they do not reduce native process capability by themselves.
 
 Treat thread visibility, the Bridge process environment, and the local OS user as trust boundaries. The app-server child receives only the explicit environment allowlist in `src/child-environment.ts`. Do not add secrets to fixtures, logs, examples, profiles, or command lines, and do not assume transport sanitization provides hostile multi-tenant isolation.
+
+Project discovery may inspect only Codex persisted cwd metadata, Git/worktree metadata, explicitly registered trusted development containers, and existing registry records. Discovery never reads project file contents, never scans an entire drive, and never enables an arbitrary thread-discovered project. `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS`, when present, is an additional emergency/static ceiling; it is not the daily project registry and cannot authorize a project by itself.
 
 Never fabricate approval or user-input request IDs. A response must match an actually pending request's ID, thread, method, and turn scope. Do not silently widen `cwd` filters into security claims. Avoid stdout diagnostics because stdout is reserved for MCP JSON-RPC; operational diagnostics belong on stderr and still require redaction.
 

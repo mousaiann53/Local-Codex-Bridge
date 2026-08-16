@@ -1,5 +1,37 @@
 # Local Codex Bridge
 
+## Project Registry authorization
+
+One Bridge instance can supervise native Codex threads across multiple explicitly authorized Git repositories and linked worktrees. Daily authorization is stored in `%LOCALAPPDATA%\LocalCodexBridge\projects.json` and is keyed by canonical Git/worktree identity, not by a broad drive or parent-directory prefix.
+
+```text
+Optional LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS static ceiling
+                         |
+                         v
+               Enabled Project Registry
+                         |
+                         v
+               Authorized native threads
+                         |
+                         v
+                    Bridge tools
+```
+
+Thread metadata and local scans may discover a real Git repository/worktree as a pending project, but discovery does not enable it. Explicit local management is required before remote execution:
+
+```powershell
+.\windows\LocalCodexBridgeControl.ps1 projects
+.\windows\LocalCodexBridgeControl.ps1 project-scan -CodexExe C:\path\to\codex.exe
+.\windows\LocalCodexBridgeControl.ps1 project-add D:\Projects\example
+.\windows\LocalCodexBridgeControl.ps1 project-enable project_<id>
+.\windows\LocalCodexBridgeControl.ps1 project-disable project_<id>
+.\windows\LocalCodexBridgeControl.ps1 project-remove project_<id>
+```
+
+An explicitly trusted development container can be added with `project-add D:\Projects -Container`. A container never authorizes arbitrary files directly; bounded scanning only discovers real Git repositories/worktrees below it. Drive roots are rejected, and project scanning is limited to Codex state-DB cwd metadata, known Git worktrees, enabled trusted containers, and existing registry records. It does not recursively scan the machine or read project file contents.
+
+`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` remains available as an optional emergency/static ceiling. It cannot authorize a project by itself and should not be maintained as the normal per-project registry.
+
 *A thin MCP control bridge from ChatGPT to native Codex sessions.*
 
 Local Codex Bridge 是一个面向 Windows 的轻量 MCP stdio 桥接器：它让 ChatGPT（或其他 MCP 客户端）能够调用本机原生 Codex 会话，同时把真正的线程、回合、历史记录和执行能力继续交给官方 Codex app-server 管理。
@@ -38,8 +70,8 @@ Local Codex Bridge
 
 | 工具 | 用途 | 重要边界 |
 | --- | --- | --- |
-| `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | 只返回 persisted cwd 仍能通过 authorized-root gate 的线程；不会重建已经丢失的 Bridge 实时事件 |
-| `codex_turn` | 新建或恢复线程，并启动一个回合 | effective cwd 必须位于 `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS`；返回“已接受”不等于任务完成 |
+| `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | 只返回 persisted cwd 属于 enabled Project Registry 项目的线程，支持 `project_id` / `cwd` 过滤并返回 `project_id`；不会重建已经丢失的 Bridge 实时事件 |
+| `codex_turn` | 新建或恢复线程，并启动一个回合 | effective cwd 必须属于 enabled Project Registry 项目；返回“已接受”不等于任务完成 |
 | `codex_observe` | 读取有界的实时事件、待处理请求、终态和游标 | `wait_ms` 最长 10 秒，只做一次事件驱动等待；安静不代表卡死 |
 | `codex_steer` | 向同一个活动回合追加纠正或新意图 | 必须匹配准确的 `thread_id` 和 `expected_turn_id`；不会新建回合 |
 | `codex_respond` | 回答受支持的真实审批或用户输入请求 | 必须使用原始 request ID 及准确的线程、方法和回合范围；不支持的方法保持 pending，不能虚构请求 |
@@ -77,11 +109,10 @@ npm test
 
 ```powershell
 $env:CODEX_EXE = 'C:\path\to\codex.exe' # codex 已在 PATH 时可省略
-$env:LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS = 'D:\Work\Repo;D:\Work\Repo\.worktrees\task'
 npm start
 ```
 
-`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` 是强制授权根目录列表，多个现存目录以分号分隔。未配置或配置为空时，Bridge 会 fail closed。新线程、恢复线程、list/read、observe、steer、respond 和 interrupt 都会验证 persisted cwd；恢复时即使提供 cwd override，也必须先验证原 persisted cwd。路径先解析为真实目录，再按 Windows 目录 identity 的 ancestor 关系检查，而不是比较字符串前缀；UNC、device path、根外 `..` 逃逸及解析到根外的 symlink/junction 都会被拒绝。
+Project Registry 是日常项目授权来源；没有 enabled 项目时 Bridge 的执行与 thread control 会 fail closed。新线程、恢复线程、list/read、observe、steer、respond 和 interrupt 都会验证 persisted cwd 对应的 canonical Git/worktree identity。自动发现只写入 pending/disabled 记录，必须通过本地命令显式启用。`LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` 如有配置，仅作为更外层 emergency/static ceiling。路径仍会解析为真实目录并拒绝 UNC、device path、根外 `..` 逃逸及解析到项目外的 symlink/junction。
 
 Hardened Bridge 还要求 `%ProgramData%\OpenAI\Codex\requirements.toml` 精确设置第二层 ceiling：
 
@@ -98,7 +129,6 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
 command: node
 args:    C:\absolute\path\to\Local-Codex-Bridge\dist\src\index.js
 env:     CODEX_EXE=C:\path\to\codex.exe   # 可选
-         LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS=D:\Work\Repo;D:\Work\Repo\.worktrees\task
 ```
 
 不同客户端的配置文件格式并不相同，但最终应直接运行 `node dist/src/index.js`。不要在 Secure MCP Tunnel 或其他严格的 JSON-RPC stdio 客户端后面使用 `npm start`，因为 npm 生命周期输出可能污染 stdout 协议流。

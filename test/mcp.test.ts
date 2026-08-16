@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { CHECKPOINT_DIRECTORY_ENV } from "../src/checkpoint.js";
+import {
+  PROJECT_REGISTRY_PATH_ENV,
+  ProjectRegistry,
+} from "../src/project-registry.js";
 import { ALLOWED_ROOTS_ENV } from "../src/workspace-roots.js";
 
 type RpcId = string | number;
@@ -227,10 +231,20 @@ test("MCP rejects a duplicate active typed id without disturbing cancellation, c
     `process.argv.splice(2, 0, "app-server");\nvoid import(${JSON.stringify(pathToFileURL(fakeCodex).href)});\n`,
     "utf8",
   );
+  execFileSync("git", ["init", "--quiet", fakeDirectory], {
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  const registryPath = join(fakeDirectory, "projects.json");
+  new ProjectRegistry({
+    filePath: registryPath,
+    environment: { [ALLOWED_ROOTS_ENV]: fakeDirectory },
+  }).add(fakeDirectory, { discoveredFrom: "test" });
   const client = new TestClient({
     ...process.env,
     CODEX_EXE: process.execPath,
     [ALLOWED_ROOTS_ENV]: fakeDirectory,
+    [PROJECT_REGISTRY_PATH_ENV]: registryPath,
   }, fakeDirectory);
   try {
     await initialize(client, 1);
@@ -339,10 +353,12 @@ test("MCP rejects materially different repeated initialize identities", async ()
   }
 });
 
-test("MCP rejects codex_turn before app-server launch when allowed roots are unset", async () => {
+test("MCP rejects codex_turn before app-server launch when no project is enabled", async () => {
+  const registryDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-empty-registry-"));
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
     CODEX_EXE: "Z:\\definitely-missing\\codex.exe",
+    [PROJECT_REGISTRY_PATH_ENV]: join(registryDirectory, "projects.json"),
   };
   delete environment[ALLOWED_ROOTS_ENV];
   const client = new TestClient(environment);
@@ -358,10 +374,11 @@ test("MCP rejects codex_turn before app-server launch when allowed roots are uns
     const result = response.result as Record<string, unknown>;
     assert.equal(result.isError, true);
     const content = result.content as Array<Record<string, unknown>>;
-    assert.match(content[0]?.text as string, new RegExp(ALLOWED_ROOTS_ENV));
+    assert.match(content[0]?.text as string, /No enabled projects/);
     assert.doesNotMatch(content[0]?.text as string, /Failed to spawn/);
   } finally {
     assert.equal(await client.close(), 0);
+    rmSync(registryDirectory, { recursive: true, force: true });
   }
 });
 

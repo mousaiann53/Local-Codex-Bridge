@@ -1,8 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('build', 'start', 'stop', 'status', 'rebuild', 'health')]
+    [ValidateSet('build', 'start', 'stop', 'status', 'rebuild', 'health', 'projects', 'project-add', 'project-remove', 'project-enable', 'project-disable', 'project-scan')]
     [string]$Action,
+    [Parameter(Position = 1)]
+    [string]$Value,
+    [switch]$Container,
     [string]$CodexExe = $env:CODEX_EXE
 )
 
@@ -11,6 +14,7 @@ Set-StrictMode -Version Latest
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $entryPoint = Join-Path $repositoryRoot 'dist\src\index.js'
+$projectProgram = Join-Path $repositoryRoot 'dist\src\project-registry-cli.js'
 $healthProgram = Join-Path $PSScriptRoot 'LocalCodexBridgeHealth.mjs'
 
 function Get-NodeExecutable {
@@ -54,6 +58,17 @@ function Test-BuiltEntryPoint {
     if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
         throw "Build output is missing: $entryPoint. Run the build action first."
     }
+}
+
+function Invoke-ProjectRegistry([string]$NodeExecutable, [string]$RegistryAction, [string]$RegistryValue, [bool]$AsContainer) {
+    if (-not (Test-Path -LiteralPath $projectProgram -PathType Leaf)) {
+        throw "Project Registry program is missing: $projectProgram. Run the build action first."
+    }
+    $arguments = @($projectProgram, $RegistryAction)
+    if (-not [string]::IsNullOrWhiteSpace($RegistryValue)) { $arguments += $RegistryValue }
+    if ($AsContainer) { $arguments += '--container' }
+    & $NodeExecutable @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Project Registry action failed with exit code $LASTEXITCODE" }
 }
 
 function Invoke-BridgeHealth([string]$NodeExecutable, [string]$CanonicalCodexExe) {
@@ -120,5 +135,35 @@ switch ($Action) {
         $node = Get-NodeExecutable
         $codex = Get-CodexExecutable
         Invoke-BridgeHealth $node $codex
+    }
+    'projects' {
+        Invoke-ProjectRegistry (Get-NodeExecutable) 'projects' $Value $false
+    }
+    'project-add' {
+        if ([string]::IsNullOrWhiteSpace($Value)) { throw 'project-add requires a Git project path.' }
+        Invoke-ProjectRegistry (Get-NodeExecutable) 'project-add' $Value ([bool]$Container)
+    }
+    'project-remove' {
+        if ([string]::IsNullOrWhiteSpace($Value)) { throw 'project-remove requires a project_id or container_id.' }
+        Invoke-ProjectRegistry (Get-NodeExecutable) 'project-remove' $Value $false
+    }
+    'project-enable' {
+        if ([string]::IsNullOrWhiteSpace($Value)) { throw 'project-enable requires a project_id or container_id.' }
+        Invoke-ProjectRegistry (Get-NodeExecutable) 'project-enable' $Value $false
+    }
+    'project-disable' {
+        if ([string]::IsNullOrWhiteSpace($Value)) { throw 'project-disable requires a project_id or container_id.' }
+        Invoke-ProjectRegistry (Get-NodeExecutable) 'project-disable' $Value $false
+    }
+    'project-scan' {
+        $node = Get-NodeExecutable
+        $codex = Get-CodexExecutable
+        $oldCodexExe = $env:CODEX_EXE
+        try {
+            $env:CODEX_EXE = $codex
+            Invoke-ProjectRegistry $node 'project-scan' $Value $false
+        } finally {
+            $env:CODEX_EXE = $oldCodexExe
+        }
     }
 }
