@@ -159,6 +159,7 @@ test("discovery is pending, persists atomically, and explicit add enables the pr
     assert.equal(enabled.display_name, "Pending Project");
     assert.equal(enabled.created_at, pending.created_at);
     assert.equal(enabled.last_seen_at, "2026-08-16T02:00:00.000Z");
+    assert.deepEqual(registry.listEnabledProjects(), [enabled]);
 
     const reloaded = new ProjectRegistry({ filePath: registry.filePath });
     assert.deepEqual(reloaded.list(), [enabled]);
@@ -217,6 +218,37 @@ test("authorization is project-scoped and enable, disable, and remove are persis
     assert.equal(registry.remove(firstRecord.project_id).project_id, firstRecord.project_id);
     assert.equal(registry.get(firstRecord.project_id), null);
     assert.throws(() => registry.authorizeCwd(firstChild), /enabled project/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("persisted cwd authorization avoids known-project writes and discovers only unknown Git cwd", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "project-registry-persisted-cwd-"));
+  try {
+    const known = initializeRepository(directory, "known");
+    const knownChild = path.join(known, "packages", "app");
+    mkdirSync(knownChild, { recursive: true });
+    const unknown = initializeRepository(directory, "unknown");
+    const registry = temporaryRegistry(directory, {
+      now: () => new Date("2026-08-16T01:00:00.000Z"),
+    });
+    const enabled = registry.add(known, { discoveredFrom: "test" });
+    const before = readFileSync(registry.filePath, "utf8");
+
+    const authorization = registry.authorizePersistedCwd(knownChild, "codex_thread");
+    assert.equal(authorization?.project.project_id, enabled.project_id);
+    assert.equal(authorization?.canonical_cwd, realpathSync.native(knownChild));
+    assert.equal(readFileSync(registry.filePath, "utf8"), before);
+    assert.equal(registry.get(enabled.project_id)?.last_seen_at, enabled.last_seen_at);
+
+    assert.equal(registry.authorizePersistedCwd(unknown, "codex_thread"), null);
+    const pending = registry.projectForCwd(unknown, false);
+    assert.equal(pending?.enabled, false);
+    assert.equal(pending?.discovered_from, "codex_thread");
+
+    registry.disable(enabled.project_id);
+    assert.equal(registry.authorizePersistedCwd(knownChild, "codex_thread"), null);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -296,6 +328,11 @@ test("tampered and duplicate Git identity fields fail closed", () => {
     writeFileSync(registry.filePath, `${JSON.stringify(tampered)}\n`, "utf8");
     assert.equal(registry.projectForCwd(first), null);
     assert.throws(() => registry.authorizeCwd(first), /enabled project/);
+    assert.throws(() => registry.listEnabledProjects(), /Git identity changed/);
+    assert.throws(
+      () => registry.authorizePersistedCwd(first, "codex_thread"),
+      /Persisted project metadata does not match/,
+    );
 
     const duplicateIdentity = structuredClone(original);
     duplicateIdentity.projects.push({

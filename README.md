@@ -32,6 +32,8 @@ An explicitly trusted development container can be added with `project-add D:\Pr
 
 `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` remains available as an optional emergency/static ceiling. It cannot authorize a project by itself and should not be maintained as the normal per-project registry.
 
+`codex_threads` keeps its existing thread list/read behavior by default and reads all stable native thread source kinds from the Codex state DB, including `exec`. Call it with `{ "mode": "projects" }` to list every enabled Project Registry entry directly, including enabled projects with no threads. Project rows contain `project_id`, `display_name`, `canonical_root`, `git_root`, `enabled`, and a deduplicated persisted `thread_count`; pending or disabled project paths are never returned.
+
 *A thin MCP control bridge from ChatGPT to native Codex sessions.*
 
 Local Codex Bridge 是一个面向 Windows 的轻量 MCP stdio 桥接器：它让 ChatGPT（或其他 MCP 客户端）能够调用本机原生 Codex 会话，同时把真正的线程、回合、历史记录和执行能力继续交给官方 Codex app-server 管理。

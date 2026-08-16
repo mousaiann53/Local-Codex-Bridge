@@ -12,10 +12,11 @@ import {
 } from "./runtime.js";
 import {
   WorkspaceRootPolicy,
+  validateWindowsCwd,
 } from "./workspace-roots.js";
 import type { ProjectRecord } from "./project-registry.js";
 
-export { validateWindowsCwd } from "./workspace-roots.js";
+export { validateWindowsCwd };
 
 export interface ToolDefinition {
   name: string;
@@ -53,15 +54,34 @@ const SUPPORTED_RESPONSE_METHODS = new Set([
   "item/tool/requestUserInput",
 ]);
 
+const ALL_STABLE_THREAD_SOURCE_KINDS = [
+  "cli",
+  "vscode",
+  "exec",
+  "appServer",
+  "subAgent",
+  "subAgentReview",
+  "subAgentCompact",
+  "subAgentThreadSpawn",
+  "subAgentOther",
+  "unknown",
+] as const;
+
 export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   {
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List/search/read persistent native Codex threads whose Git project is enabled in the Local Codex Bridge Project Registry. Supports project_id and cwd filters, and returns project_id for every visible thread. This does not reconstruct live Bridge events.",
+      "List/search/read persistent native Codex threads whose Git project is enabled in the Local Codex Bridge Project Registry. mode=projects directly lists enabled registry projects, including projects with no threads, with a persisted thread_count. Supports project_id and cwd filters in the default threads mode, and returns project_id for every visible thread. This does not reconstruct live Bridge events.",
     inputSchema: {
       type: "object",
       properties: {
+        mode: {
+          type: "string",
+          enum: ["threads", "projects"],
+          default: "threads",
+          description: "Use projects to list enabled Project Registry entries directly; omit for existing thread list/read behavior.",
+        },
         thread_id: {
           type: "string",
           minLength: 1,
@@ -480,6 +500,10 @@ function enumValue<T extends string>(
   return value as T;
 }
 
+function normalizedCwdCacheKey(value: string): string {
+  return validateWindowsCwd(value).toLocaleLowerCase("en-US");
+}
+
 function responseRecord(value: unknown, method: string): Record<string, unknown> {
   const record = asObject(value, `${method} response`);
   return record;
@@ -500,6 +524,11 @@ export interface WorkspaceAuthorizationPolicy {
   discoverCwd?(value: string, source: string): ProjectRecord | null;
   projectForCwd?(value: string, enabledOnly?: boolean): ProjectRecord | null;
   projectById?(projectId: string): ProjectRecord | null;
+  listEnabledProjects?(): ProjectRecord[];
+  authorizePersistedCwd?(
+    value: string,
+    discoveredFrom: string,
+  ): { project: ProjectRecord; canonical_cwd: string } | null;
 }
 
 function extractThreadCwd(result: unknown): string {
@@ -694,6 +723,19 @@ export class ControlSurface {
     value: string,
     discoveredFrom?: string,
   ): { cwd: string; projectId: string | null } {
+    if (discoveredFrom && this.workspaceRoots.authorizePersistedCwd) {
+      const authorization = this.workspaceRoots.authorizePersistedCwd(
+        value,
+        discoveredFrom,
+      );
+      if (!authorization) {
+        throw new Error("persisted cwd does not belong to an enabled project");
+      }
+      return {
+        cwd: authorization.canonical_cwd,
+        projectId: authorization.project.project_id,
+      };
+    }
     if (discoveredFrom) this.#discoverCwd(value, discoveredFrom);
     const cwd = this.workspaceRoots.authorizeCwd(value);
     const project = this.#projectForCwd(cwd);
@@ -825,7 +867,12 @@ export class ControlSurface {
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["mode", "thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
+    const mode = enumValue(args, "mode", ["threads", "projects"] as const) ?? "threads";
+    if (mode === "projects") {
+      onlyKeys(args, ["mode"]);
+      return await this.#projects();
+    }
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
       if (args.cwd !== undefined || args.project_id !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
@@ -870,6 +917,9 @@ export class ControlSurface {
       limit,
       sortKey: "updated_at",
       sortDirection: "desc",
+      archived: false,
+      useStateDbOnly: true,
+      sourceKinds: ALL_STABLE_THREAD_SOURCE_KINDS,
       ...(cwd ? { cwd } : {}),
       ...(searchTerm ? { searchTerm } : {}),
       ...(cursor ? { cursor } : {}),
@@ -878,16 +928,33 @@ export class ControlSurface {
     if (!Array.isArray(page.data)) {
       throw new Error("thread/list returned no data array");
     }
+    type CachedAuthorization =
+      | { ok: true; value: { cwd: string; projectId: string | null } }
+      | { ok: false; error: unknown };
+    const authorizationCache = new Map<string, CachedAuthorization>();
+    const authorizeThreadCwd = (value: string): { cwd: string; projectId: string | null } => {
+      const key = normalizedCwdCacheKey(value);
+      const cached = authorizationCache.get(key);
+      if (cached) {
+        if (!cached.ok) throw cached.error;
+        return cached.value;
+      }
+      try {
+        const authorization = this.#authorizeProjectCwd(value, "codex_thread");
+        authorizationCache.set(key, { ok: true, value: authorization });
+        return authorization;
+      } catch (error) {
+        authorizationCache.set(key, { ok: false, error });
+        throw error;
+      }
+    };
     const visible = page.data.flatMap((value) => {
       try {
         const thread = asObject(value, "thread/list item");
         if (typeof thread.id !== "string" || thread.id.length === 0) {
           return [];
         }
-        const authorization = this.#authorizeProjectCwd(
-          extractThreadCwd({ thread }),
-          "codex_thread",
-        );
+        const authorization = authorizeThreadCwd(extractThreadCwd({ thread }));
         if (projectFilter && authorization.projectId !== projectFilter.project_id) {
           return [];
         }
@@ -913,6 +980,104 @@ export class ControlSurface {
       nextCursor: typeof page.nextCursor === "string" ? page.nextCursor : null,
       backwardsCursor: typeof page.backwardsCursor === "string" ? page.backwardsCursor : null,
       data: visible,
+    };
+  }
+
+  async #projects(): Promise<unknown> {
+    if (!this.workspaceRoots.listEnabledProjects) {
+      throw new Error("Project listing requires the Local Codex Bridge Project Registry");
+    }
+    const projects = this.workspaceRoots.listEnabledProjects().sort((left, right) =>
+      left.project_id.localeCompare(right.project_id),
+    );
+    const projectIds = new Set(projects.map((project) => project.project_id));
+    const threadProjects = new Map<string, string>();
+    const projectCache = new Map<string, string | null>();
+    for (const archived of [false, true]) {
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      for (let pageIndex = 0; pageIndex < 10_000; pageIndex += 1) {
+        const result = await this.appServer.request("thread/list", {
+          limit: 100,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived,
+          useStateDbOnly: true,
+          sourceKinds: ALL_STABLE_THREAD_SOURCE_KINDS,
+          ...(cursor ? { cursor } : {}),
+        });
+        const page = responseRecord(result, "thread/list");
+        if (!Array.isArray(page.data)) {
+          throw new Error("thread/list returned no data array");
+        }
+        for (const value of page.data) {
+          if (value === null || typeof value !== "object" || Array.isArray(value)) {
+            continue;
+          }
+          const thread = value as Record<string, unknown>;
+          if (
+            typeof thread.id !== "string" ||
+            thread.id.length === 0 ||
+            typeof thread.cwd !== "string"
+          ) {
+            continue;
+          }
+          let key: string;
+          try {
+            key = normalizedCwdCacheKey(thread.cwd);
+          } catch {
+            continue;
+          }
+          let projectId: string | null;
+          if (projectCache.has(key)) {
+            projectId = projectCache.get(key) ?? null;
+          } else {
+            if (this.workspaceRoots.authorizePersistedCwd) {
+              const authorization = this.workspaceRoots.authorizePersistedCwd(
+                thread.cwd,
+                "codex_thread",
+              );
+              projectId = authorization?.project.project_id ?? null;
+            } else {
+              projectId = this.#projectForCwd(thread.cwd)?.project_id ?? null;
+            }
+            projectCache.set(key, projectId);
+          }
+          if (projectId && projectIds.has(projectId)) {
+            threadProjects.set(thread.id, projectId);
+          }
+        }
+        const nextCursor = typeof page.nextCursor === "string" && page.nextCursor.length > 0
+          ? page.nextCursor
+          : undefined;
+        if (!nextCursor) break;
+        if (seenCursors.has(nextCursor)) {
+          throw new Error("thread/list returned a repeated cursor");
+        }
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+        if (pageIndex === 9_999) {
+          throw new Error("thread/list pagination exceeded its bound");
+        }
+      }
+    }
+    const threadCounts = new Map<string, number>();
+    for (const projectId of threadProjects.values()) {
+      threadCounts.set(projectId, (threadCounts.get(projectId) ?? 0) + 1);
+    }
+    return {
+      source: "local_codex_bridge_project_registry",
+      mode: "projects",
+      nextCursor: null,
+      backwardsCursor: null,
+      data: projects.map((project) => ({
+        project_id: project.project_id,
+        display_name: project.display_name,
+        canonical_root: project.canonical_root,
+        git_root: project.git_root,
+        enabled: true,
+        thread_count: threadCounts.get(project.project_id) ?? 0,
+      })),
     };
   }
 

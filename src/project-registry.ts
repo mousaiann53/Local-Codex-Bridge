@@ -487,6 +487,19 @@ export class ProjectRegistry {
     return this.list();
   }
 
+  listEnabledProjects(): ProjectRecord[] {
+    return this.#read().projects
+      .filter((project) => project.enabled)
+      .map((project) => {
+        const metadata = inspectGitProject(project.canonical_root);
+        if (!recordMatchesMetadata(project, metadata)) {
+          throw new Error("Enabled project Git identity changed; rediscover it before use");
+        }
+        this.#requireInsideCeiling(metadata.canonical_root);
+        return cloneRecord(project);
+      });
+  }
+
   listContainers(enabledOnly = false): TrustedContainerRecord[] {
     return this.#read().trusted_containers
       .filter((container) => !enabledOnly || container.enabled)
@@ -683,6 +696,49 @@ export class ProjectRegistry {
       }
     }
     return project ? cloneRecord(project) : null;
+  }
+
+  authorizePersistedCwd(cwd: string, discoveredFrom: string): AuthorizedProject | null {
+    let metadata: GitProjectMetadata;
+    try {
+      metadata = inspectGitProject(cwd);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        [
+          "cwd must belong to a real Git repository or worktree",
+          "cwd must resolve to an existing local directory",
+        ].includes(error.message)
+      ) {
+        return null;
+      }
+      throw error;
+    }
+    const projects = this.#read().projects;
+    const id = projectId(metadata);
+    const project = projects.find((candidate) =>
+      candidate.project_id === id ||
+      candidate.worktree_identity === metadata.worktree_identity ||
+      windowsPathKey(candidate.canonical_root) === windowsPathKey(metadata.canonical_root)
+    );
+    if (!project) {
+      this.#upsert(metadata, {
+        enabled: false,
+        discoveredFrom,
+      });
+      return null;
+    }
+    if (!recordMatchesMetadata(project, metadata)) {
+      throw new Error("Persisted project metadata does not match the live Git worktree");
+    }
+    if (!project.enabled) {
+      return null;
+    }
+    const canonicalCwd = new WorkspaceRootPolicy([
+      project.canonical_root,
+    ]).authorizeCwd(cwd);
+    this.#requireInsideCeiling(metadata.canonical_root);
+    return { project: cloneRecord(project), canonical_cwd: canonicalCwd };
   }
 
   authorizeProjectCwd(cwd: string): AuthorizedProject {

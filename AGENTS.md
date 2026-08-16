@@ -20,7 +20,7 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 
 The seven public tools have distinct semantics:
 
-- `codex_threads`: list/search/read only persistent native threads whose persisted cwd belongs to an enabled Project Registry entry; list results include `project_id`.
+- `codex_threads`: list/search/read only persistent native threads whose persisted cwd belongs to an enabled Project Registry entry; list results include `project_id` and explicitly query all stable state-DB source kinds. Its explicit `mode=projects` view lists only enabled, currently valid Project Registry entries, including zero-thread projects, and never exposes pending paths.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
