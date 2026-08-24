@@ -191,6 +191,13 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
       "codex_interrupt",
       "codex_checkpoint",
     ]);
+    const threadsTool = tools.find((tool) => tool.name === "codex_threads");
+    const threadsProperties = (
+      threadsTool?.inputSchema as Record<string, unknown>
+    ).properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(threadsProperties.mode?.enum, ["threads", "projects"]);
+    assert.equal(threadsProperties.mode?.default, "threads");
+    assert.equal(threadsProperties.project_id?.type, "string");
     for (const tool of tools) {
       assert.equal(typeof tool.title, "string");
       assert.equal(typeof tool.description, "string");
@@ -221,6 +228,18 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
   } finally {
     assert.equal(await client.close(), 0);
   }
+});
+
+test("Windows npm actions pin the repository root and restore the caller cwd", () => {
+  const controlPath = fileURLToPath(
+    new URL("../../windows/LocalCodexBridgeControl.ps1", import.meta.url),
+  );
+  const controlSource = readFileSync(controlPath, "utf8");
+  assert.match(controlSource, /Set-Location\s+-LiteralPath\s+\$repositoryRoot/);
+  assert.match(
+    controlSource,
+    /finally\s*\{\s*Set-Location\s+-LiteralPath\s+\$originalLocation\s*\}/,
+  );
 });
 
 test("MCP rejects a duplicate active typed id without disturbing cancellation, cleanup, or reuse", async () => {

@@ -202,10 +202,11 @@ test("Project Registry gates every thread operation and annotates authorized thr
         ["thread/list", true, undefined],
       ],
     );
-    await assert.rejects(
-      control.call("codex_threads", { mode: "projects", limit: 1 }),
-      /Unknown argument field: limit/,
-    );
+    const projectsWithLegacyLimit = await control.call("codex_threads", {
+      mode: "projects",
+      limit: 100,
+    });
+    assert.deepEqual(projectsWithLegacyLimit, projects);
 
     const filtered = await control.call("codex_threads", {
       project_id: enabledProject.project_id,

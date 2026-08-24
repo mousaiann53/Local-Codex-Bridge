@@ -316,6 +316,22 @@ export class McpStdioServer {
       return;
     }
     if (method === "tools/list") {
+      const threadsTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_threads");
+      const threadsProperties = asRecord(threadsTool?.inputSchema.properties);
+      const modeSchema = asRecord(threadsProperties?.mode);
+      const projectIdSchema = asRecord(threadsProperties?.project_id);
+      if (
+        !Array.isArray(modeSchema?.enum) ||
+        !structurallyEqual(modeSchema.enum, ["threads", "projects"]) ||
+        modeSchema.default !== "threads" ||
+        projectIdSchema?.type !== "string"
+      ) {
+        await this.#sendError(id, {
+          code: -32603,
+          message: "codex_threads public schema contract is incomplete",
+        });
+        return;
+      }
       await this.#sendResult(id, { tools: TOOL_DEFINITIONS });
       return;
     }

@@ -870,7 +870,8 @@ export class ControlSurface {
     onlyKeys(args, ["mode", "thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
     const mode = enumValue(args, "mode", ["threads", "projects"] as const) ?? "threads";
     if (mode === "projects") {
-      onlyKeys(args, ["mode"]);
+      onlyKeys(args, ["mode", "limit"]);
+      optionalInteger(args, "limit", 1, 100);
       return await this.#projects();
     }
     const threadId = optionalString(args, "thread_id", 200);

@@ -50,8 +50,14 @@ function Get-CodexExecutable {
 
 function Invoke-NpmScript([string[]]$Arguments) {
     $npm = Get-Command npm.cmd -ErrorAction Stop
-    & $npm.Source @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
+    $originalLocation = (Get-Location).Path
+    try {
+        Set-Location -LiteralPath $repositoryRoot
+        & $npm.Source @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
+    } finally {
+        Set-Location -LiteralPath $originalLocation
+    }
 }
 
 function Test-BuiltEntryPoint {
