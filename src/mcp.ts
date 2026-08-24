@@ -97,9 +97,19 @@ function initializeMismatch(
   if (!structurallyEqual(first.capabilities, repeated.capabilities)) {
     return "capabilities";
   }
-  if (!structurallyEqual(first.clientInfo, repeated.clientInfo)) {
+
+  const firstClientInfo = asRecord(first.clientInfo);
+  const repeatedClientInfo = asRecord(repeated.clientInfo);
+  const firstClientName = firstClientInfo?.name;
+  const repeatedClientName = repeatedClientInfo?.name;
+  if (typeof firstClientName === "string" && typeof repeatedClientName === "string") {
+    if (firstClientName !== repeatedClientName) {
+      return "clientInfo";
+    }
+  } else if (!structurallyEqual(first.clientInfo, repeated.clientInfo)) {
     return "clientInfo";
   }
+
   return null;
 }
 
