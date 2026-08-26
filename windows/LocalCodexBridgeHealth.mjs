@@ -13,6 +13,7 @@ const child = spawn(process.execPath, [entryPoint], {
 });
 const expectedTools = new Set([
   "codex_threads",
+  "codex_projects",
   "codex_turn",
   "codex_observe",
   "codex_steer",
@@ -66,7 +67,7 @@ child.stdout.on("data", (chunk) => {
     if (message.id === 2) {
       const names = new Set((message.result?.tools ?? []).map((tool) => tool?.name));
       if (names.size !== expectedTools.size || [...expectedTools].some((name) => !names.has(name))) {
-        fail("tools/list did not expose exactly the seven public tools");
+        fail("tools/list did not expose exactly the eight public tools");
         return;
       }
       completed = true;

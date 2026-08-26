@@ -164,8 +164,21 @@ test("Project Registry gates every thread operation and annotates authorized thr
     authorizationCalls.clear();
     ownershipCalls.clear();
     persistedAuthorizationCalls.clear();
-    const projects = await control.call("codex_threads", {
-      mode: "projects",
+    const listedWithLegacyLimit = await control.call("codex_threads", {
+      limit: 100,
+    }) as Record<string, unknown>;
+    assert.deepEqual(
+      (listedWithLegacyLimit.data as Array<Record<string, unknown>>).map((thread) => thread.id),
+      ["thread-a"],
+    );
+    assert.equal(calls[0]?.params.limit, 100);
+
+    calls.length = 0;
+    authorizationCalls.clear();
+    ownershipCalls.clear();
+    persistedAuthorizationCalls.clear();
+    const projects = await control.call("codex_projects", {
+      limit: 100,
     }) as Record<string, unknown>;
     assert.equal(projects.source, "local_codex_bridge_project_registry");
     assert.equal(projects.mode, "projects");
@@ -173,6 +186,7 @@ test("Project Registry gates every thread operation and annotates authorized thr
     assert.deepEqual(projects.data, [
       {
         project_id: enabledProject.project_id,
+        cwd: enabledProject.canonical_root,
         display_name: enabledProject.display_name,
         canonical_root: enabledProject.canonical_root,
         git_root: enabledProject.git_root,
@@ -181,6 +195,7 @@ test("Project Registry gates every thread operation and annotates authorized thr
       },
       {
         project_id: enabledProjectWithoutThreads.project_id,
+        cwd: enabledProjectWithoutThreads.canonical_root,
         display_name: "Enabled Without Threads",
         canonical_root: enabledProjectWithoutThreads.canonical_root,
         git_root: enabledProjectWithoutThreads.git_root,
@@ -202,11 +217,10 @@ test("Project Registry gates every thread operation and annotates authorized thr
         ["thread/list", true, undefined],
       ],
     );
-    const projectsWithLegacyLimit = await control.call("codex_threads", {
-      mode: "projects",
-      limit: 100,
-    });
-    assert.deepEqual(projectsWithLegacyLimit, projects);
+    await assert.rejects(
+      control.call("codex_threads", { mode: "projects" }),
+      /Unknown argument field: mode/,
+    );
 
     const filtered = await control.call("codex_threads", {
       project_id: enabledProject.project_id,

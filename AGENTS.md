@@ -18,9 +18,10 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 
 `src/mcp.ts` owns the MCP boundary, `src/app-server.ts` owns the official child-process protocol, `src/tools.ts` owns the public tool contract, `src/project-registry.ts` owns project authorization state and Git/worktree identity, and `src/runtime.ts` owns ephemeral live state. `src/checkpoint.ts` provides the separate optional local checkpoint store. The Windows Tray and Secure MCP Tunnel integration are optional layers; the Tunnel itself is external to this repository.
 
-The seven public tools have distinct semantics:
+The eight public tools have distinct semantics:
 
-- `codex_threads`: list/search/read only persistent native threads whose persisted cwd belongs to an enabled Project Registry entry; list results include `project_id` and explicitly query all stable state-DB source kinds. Its explicit `mode=projects` view lists only enabled, currently valid Project Registry entries, including zero-thread projects, and never exposes pending paths.
+- `codex_threads`: list/search/read only persistent native threads whose persisted cwd belongs to an enabled Project Registry entry; list results include `project_id` and explicitly query all stable state-DB source kinds. Its public input schema remains backward compatible and contains no project-listing mode.
+- `codex_projects`: list only enabled, currently valid Project Registry entries, including zero-thread projects. Each row returns `project_id`, canonical `cwd`, and a deduplicated persisted `thread_count`; pending or disabled paths are never exposed.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
@@ -57,7 +58,7 @@ Prefer evidence from the current source, tests, package metadata, and actual mac
 A rebuild or install should demonstrate, as applicable:
 
 - dependency installation, type checking, build, and the regular automated test suite succeed;
-- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the seven intended tools;
+- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the eight intended tools;
 - the official app-server executable is resolved and launched with the expected stdio arguments;
 - persistent native history and ephemeral Bridge state remain clearly separated;
 - no author-specific path, credential, Tunnel profile, port, or secret has entered the repository or generic setup;

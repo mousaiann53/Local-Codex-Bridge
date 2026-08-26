@@ -72,16 +72,10 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List/search/read persistent native Codex threads whose Git project is enabled in the Local Codex Bridge Project Registry. mode=projects directly lists enabled registry projects, including projects with no threads, with a persisted thread_count. Supports project_id and cwd filters in the default threads mode, and returns project_id for every visible thread. This does not reconstruct live Bridge events.",
+      "List/search/read persistent native Codex threads whose Git project is enabled in the Local Codex Bridge Project Registry. Supports project_id and cwd filters, and returns project_id for every visible thread. This does not reconstruct live Bridge events.",
     inputSchema: {
       type: "object",
       properties: {
-        mode: {
-          type: "string",
-          enum: ["threads", "projects"],
-          default: "threads",
-          description: "Use projects to list enabled Project Registry entries directly; omit for existing thread list/read behavior.",
-        },
         thread_id: {
           type: "string",
           minLength: 1,
@@ -125,6 +119,32 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     },
     annotations: {
       title: "Codex Threads",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "codex_projects",
+    title: "Codex Projects",
+    description:
+      "List enabled Local Codex Bridge Project Registry entries, including projects with no persisted threads, with a deduplicated persisted thread_count.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          default: 20,
+          description: "Maximum projects in the returned list.",
+        },
+      },
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Codex Projects",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -606,6 +626,8 @@ export class ControlSurface {
     switch (name) {
       case "codex_threads":
         return await this.#threads(args);
+      case "codex_projects":
+        return await this.#projects(args);
       case "codex_turn":
         return await this.#turn(args);
       case "codex_observe":
@@ -867,13 +889,7 @@ export class ControlSurface {
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["mode", "thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
-    const mode = enumValue(args, "mode", ["threads", "projects"] as const) ?? "threads";
-    if (mode === "projects") {
-      onlyKeys(args, ["mode", "limit"]);
-      optionalInteger(args, "limit", 1, 100);
-      return await this.#projects();
-    }
+    onlyKeys(args, ["thread_id", "include_turns", "cwd", "project_id", "search_term", "cursor", "limit"]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
       if (args.cwd !== undefined || args.project_id !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
@@ -984,7 +1000,9 @@ export class ControlSurface {
     };
   }
 
-  async #projects(): Promise<unknown> {
+  async #projects(args: Record<string, unknown>): Promise<unknown> {
+    onlyKeys(args, ["limit"]);
+    const limit = optionalInteger(args, "limit", 1, 100) ?? 20;
     if (!this.workspaceRoots.listEnabledProjects) {
       throw new Error("Project listing requires the Local Codex Bridge Project Registry");
     }
@@ -1071,8 +1089,9 @@ export class ControlSurface {
       mode: "projects",
       nextCursor: null,
       backwardsCursor: null,
-      data: projects.map((project) => ({
+      data: projects.slice(0, limit).map((project) => ({
         project_id: project.project_id,
+        cwd: project.canonical_root,
         display_name: project.display_name,
         canonical_root: project.canonical_root,
         git_root: project.git_root,

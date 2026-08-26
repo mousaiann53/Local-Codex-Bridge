@@ -32,13 +32,13 @@ An explicitly trusted development container can be added with `project-add D:\Pr
 
 `LOCAL_CODEX_BRIDGE_ALLOWED_ROOTS` remains available as an optional emergency/static ceiling. It cannot authorize a project by itself and should not be maintained as the normal per-project registry.
 
-`codex_threads` keeps its existing thread list/read behavior by default and reads all stable native thread source kinds from the Codex state DB, including `exec`. Call it with `{ "mode": "projects" }` to list every enabled Project Registry entry directly, including enabled projects with no threads. Project rows contain `project_id`, `display_name`, `canonical_root`, `git_root`, `enabled`, and a deduplicated persisted `thread_count`; pending or disabled project paths are never returned.
+`codex_threads` keeps its existing thread list/read behavior and reads all stable native thread source kinds from the Codex state DB, including `exec`. Its public input schema remains backward compatible. Use `codex_projects` with `{ "limit": 100 }` to list enabled Project Registry entries directly, including enabled projects with no threads. Each row returns `project_id`, canonical `cwd`, and a deduplicated persisted `thread_count`; pending or disabled project paths are never returned.
 
 *A thin MCP control bridge from ChatGPT to native Codex sessions.*
 
 Local Codex Bridge 是一个面向 Windows 的轻量 MCP stdio 桥接器：它让 ChatGPT（或其他 MCP 客户端）能够调用本机原生 Codex 会话，同时把真正的线程、回合、历史记录和执行能力继续交给官方 Codex app-server 管理。
 
-它解决的是一个很具体的问题：ChatGPT 适合对话、拆解目标和持续监督，Codex 则能在本机工作区里使用真实的文件、命令和开发工具。Bridge 在两者之间提供 7 个边界清楚的控制工具，不再额外发明一套任务系统。
+它解决的是一个很具体的问题：ChatGPT 适合对话、拆解目标和持续监督，Codex 则能在本机工作区里使用真实的文件、命令和开发工具。Bridge 在两者之间提供 8 个边界清楚的控制工具，不再额外发明一套任务系统。
 
 ## 当前公开版本
 
@@ -68,11 +68,12 @@ Local Codex Bridge
 
 当工具首次需要原生 Codex 时，Bridge 会懒启动一个官方 app-server 子进程。Bridge 自己不创建 job ID、不维护队列、不保存第二份对话历史，也不会自动重试或自动重启意外退出的 app-server。
 
-## 7 个 MCP 工具
+## 8 个 MCP 工具
 
 | 工具 | 用途 | 重要边界 |
 | --- | --- | --- |
 | `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | 只返回 persisted cwd 属于 enabled Project Registry 项目的线程，支持 `project_id` / `cwd` 过滤并返回 `project_id`；不会重建已经丢失的 Bridge 实时事件 |
+| `codex_projects` | 聚合列出 enabled Project Registry 项目 | 返回 `project_id`、canonical `cwd` 和去重 persisted `thread_count`，包括零线程项目；不会返回 pending 或 disabled 路径 |
 | `codex_turn` | 新建或恢复线程，并启动一个回合 | effective cwd 必须属于 enabled Project Registry 项目；返回“已接受”不等于任务完成 |
 | `codex_observe` | 读取有界的实时事件、待处理请求、终态和游标 | `wait_ms` 最长 10 秒，只做一次事件驱动等待；安静不代表卡死 |
 | `codex_steer` | 向同一个活动回合追加纠正或新意图 | 必须匹配准确的 `thread_id` 和 `expected_turn_id`；不会新建回合 |
@@ -222,7 +223,7 @@ npm test
 
 - `src/mcp.ts`：MCP stdio / JSON-RPC 边界
 - `src/app-server.ts`：官方 Codex app-server 子进程与协议适配
-- `src/tools.ts`：7 个工具的 schema、校验和语义
+- `src/tools.ts`：8 个工具的 schema、校验和语义
 - `src/runtime.ts`：有界实时状态、事件与 pending request
 - `src/checkpoint.ts`：可选监督 checkpoint
 - `src/ux-projection.ts` 与 `windows/`：可选 Tray 投影和 Windows 交互

@@ -318,17 +318,18 @@ export class McpStdioServer {
     if (method === "tools/list") {
       const threadsTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_threads");
       const threadsProperties = asRecord(threadsTool?.inputSchema.properties);
-      const modeSchema = asRecord(threadsProperties?.mode);
       const projectIdSchema = asRecord(threadsProperties?.project_id);
+      const projectsTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_projects");
+      const projectsProperties = asRecord(projectsTool?.inputSchema.properties);
+      const projectsLimitSchema = asRecord(projectsProperties?.limit);
       if (
-        !Array.isArray(modeSchema?.enum) ||
-        !structurallyEqual(modeSchema.enum, ["threads", "projects"]) ||
-        modeSchema.default !== "threads" ||
-        projectIdSchema?.type !== "string"
+        threadsProperties?.mode !== undefined ||
+        projectIdSchema?.type !== "string" ||
+        projectsLimitSchema?.type !== "integer"
       ) {
         await this.#sendError(id, {
           code: -32603,
-          message: "codex_threads public schema contract is incomplete",
+          message: "public tool schema contract is incomplete",
         });
         return;
       }

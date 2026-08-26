@@ -112,7 +112,7 @@ async function initialize(client: TestClient, id: RpcId): Promise<void> {
   assert.equal(response.error, undefined);
 }
 
-test("MCP stdio initializes idempotently and lists exactly seven fully annotated tools", async () => {
+test("MCP stdio initializes idempotently and lists exactly eight fully annotated tools", async () => {
   const client = new TestClient();
   try {
     const initializeLine = JSON.stringify({
@@ -184,6 +184,7 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
     const tools = (listed.result as Record<string, unknown>).tools as Array<Record<string, unknown>>;
     assert.deepEqual(tools.map((tool) => tool.name), [
       "codex_threads",
+      "codex_projects",
       "codex_turn",
       "codex_observe",
       "codex_steer",
@@ -192,12 +193,62 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
       "codex_checkpoint",
     ]);
     const threadsTool = tools.find((tool) => tool.name === "codex_threads");
-    const threadsProperties = (
-      threadsTool?.inputSchema as Record<string, unknown>
-    ).properties as Record<string, Record<string, unknown>>;
-    assert.deepEqual(threadsProperties.mode?.enum, ["threads", "projects"]);
-    assert.equal(threadsProperties.mode?.default, "threads");
-    assert.equal(threadsProperties.project_id?.type, "string");
+    assert.deepEqual(threadsTool?.inputSchema, {
+      type: "object",
+      properties: {
+        thread_id: {
+          type: "string",
+          minLength: 1,
+          description: "When supplied, read this exact Codex thread instead of listing threads.",
+        },
+        include_turns: {
+          type: "boolean",
+          default: false,
+          description: "Include persisted turns when reading one thread.",
+        },
+        cwd: {
+          type: "string",
+          description: "Optional exact absolute Windows drive-letter cwd filter for thread/list.",
+        },
+        project_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+          description: "Optional enabled Local Codex Bridge project id filter for thread/list.",
+        },
+        search_term: {
+          type: "string",
+          minLength: 1,
+          maxLength: 500,
+          description: "Optional Codex title substring filter for thread/list.",
+        },
+        cursor: {
+          type: "string",
+          minLength: 1,
+          description: "Opaque cursor returned by a prior thread/list call.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          default: 20,
+          description: "Maximum threads in the returned page.",
+        },
+      },
+      additionalProperties: false,
+    });
+    const projectsTool = tools.find((tool) => tool.name === "codex_projects");
+    const projectsSchema = projectsTool?.inputSchema as Record<string, unknown>;
+    const projectsProperties = projectsSchema.properties as Record<string, Record<string, unknown>>;
+    assert.equal(projectsSchema.additionalProperties, false);
+    assert.deepEqual(Object.keys(projectsProperties), ["limit"]);
+    assert.deepEqual(projectsProperties.limit, {
+      type: "integer",
+      minimum: 1,
+      maximum: 100,
+      default: 20,
+      description: "Maximum projects in the returned list.",
+    });
     for (const tool of tools) {
       assert.equal(typeof tool.title, "string");
       assert.equal(typeof tool.description, "string");
@@ -227,6 +278,66 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
     );
   } finally {
     assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP stdio keeps codex_threads limit calls compatible and lists projects separately", async () => {
+  const fakeDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-mcp-projects-"));
+  const fakeCodex = fileURLToPath(new URL("../../test/fake-codex.mjs", import.meta.url));
+  writeFileSync(
+    join(fakeDirectory, "app-server"),
+    `process.argv.splice(2, 0, "app-server");\nvoid import(${JSON.stringify(pathToFileURL(fakeCodex).href)});\n`,
+    "utf8",
+  );
+  execFileSync("git", ["init", "--quiet", fakeDirectory], {
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  const registryPath = join(fakeDirectory, "projects.json");
+  const project = new ProjectRegistry({
+    filePath: registryPath,
+    environment: { [ALLOWED_ROOTS_ENV]: fakeDirectory },
+  }).add(fakeDirectory, { discoveredFrom: "test" });
+  const client = new TestClient({
+    ...process.env,
+    CODEX_EXE: process.execPath,
+    [ALLOWED_ROOTS_ENV]: fakeDirectory,
+    [PROJECT_REGISTRY_PATH_ENV]: registryPath,
+  }, fakeDirectory);
+  try {
+    await initialize(client, 1);
+    const threadsResponse = await client.request(2, "tools/call", {
+      name: "codex_threads",
+      arguments: { limit: 100 },
+    });
+    assert.equal(threadsResponse.error, undefined);
+    const threads = toolPayload(threadsResponse);
+    assert.equal(threads.source, "codex_app_server");
+    assert.deepEqual(threads.data, []);
+
+    const projectsResponse = await client.request(3, "tools/call", {
+      name: "codex_projects",
+      arguments: { limit: 100 },
+    });
+    assert.equal(projectsResponse.error, undefined);
+    const projects = toolPayload(projectsResponse);
+    const listed = projects.data as Array<Record<string, unknown>>;
+    assert.equal(listed.length, 1);
+    assert.deepEqual(
+      {
+        project_id: listed[0]?.project_id,
+        cwd: listed[0]?.cwd,
+        thread_count: listed[0]?.thread_count,
+      },
+      {
+        project_id: project.project_id,
+        cwd: project.canonical_root,
+        thread_count: 0,
+      },
+    );
+  } finally {
+    assert.equal(await client.close(), 0);
+    rmSync(fakeDirectory, { recursive: true, force: true });
   }
 });
 

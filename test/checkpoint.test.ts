@@ -17,9 +17,10 @@ import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 
 const unavailableAppServer = {} as unknown as AppServerManager;
 
-test("checkpoint is the sole addition to the existing tool catalog", () => {
+test("tool catalog preserves checkpoint as the final tool", () => {
   assert.deepEqual(TOOL_DEFINITIONS.map((tool) => tool.name), [
     "codex_threads",
+    "codex_projects",
     "codex_turn",
     "codex_observe",
     "codex_steer",
